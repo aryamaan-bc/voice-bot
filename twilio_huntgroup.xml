@@ -1,0 +1,45 @@
+<!--
+  TWILIO CONFERENCE JOIN TwiML
+  ============================
+
+  WHAT THIS IS:
+  This is the TwiML that runs when Line's `transfer_call` dials the
+  CONFERENCE_JOIN_NUMBER. It drops the caller into the shared conference
+  room where Taylor or Aryamaan are already waiting (they were placed
+  there by the outbound probe call — see escalation.py).
+
+  HOW THE FLOW WORKS (for context):
+    1. Bot decides to escalate.
+    2. escalation.py places outbound probe calls to Taylor and Aryamaan
+       with inline TwiML that drops them into conference "bc-active".
+    3. If either answers, they're now in the conference.
+    4. Line's transfer_call is called with CONFERENCE_JOIN_NUMBER.
+    5. Twilio dials CONFERENCE_JOIN_NUMBER, which runs this TwiML.
+    6. The caller joins the same conference room. Everyone is bridged.
+
+  HOW TO SET UP:
+    1. Buy a second Twilio number (the "conference join" number).
+    2. Create a TwiML Bin (Twilio Console → Runtime → TwiML Bins).
+    3. Paste the <Response>...</Response> block below. Change the
+       conference name ONLY if you also changed CONFERENCE_NAME in .env
+       (default is "bc-active").
+    4. Copy the TwiML Bin's URL.
+    5. Configure the second Twilio number's Voice webhook to point at
+       the TwiML Bin URL.
+    6. Set CONFERENCE_JOIN_NUMBER in .env to that second number.
+
+  You do NOT need a separate TwiML Bin for the outbound probe — that
+  TwiML is built inline in escalation.py and passed via the Twilio
+  calls.create(twiml=...) parameter.
+-->
+
+<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Dial>
+    <Conference
+      startConferenceOnEnter="true"
+      endConferenceOnExit="true"
+      beep="false"
+    >bc-active</Conference>
+  </Dial>
+</Response>
