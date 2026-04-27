@@ -19,7 +19,7 @@ from line.llm_agent import LlmAgent, LlmConfig, end_call, transfer_call
 from line.voice_agent_app import AgentEnv, CallRequest, VoiceAgentApp
 
 from escalation import make_escalate_tool
-from linear import make_linear_tool
+from slack_ticket import make_slack_ticket_tool
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -124,11 +124,11 @@ the best one, or would you like to give me a different number?"
 2. Get the callback number. Validate it sounds like a phone number \
 (ten digits in the US, or international with country code).
 3. Call create_callback_ticket with the intent summary and callback \
-number. IMPORTANT: create the ticket BEFORE confirming to the caller, so \
-a mid-sentence hangup doesn't lose the request.
-4. Read back the ticket ID from the tool's response: "Ticket [ID] is all \
-set — someone will follow up at [number] within one business day. \
-Anything else I can help with?"
+number. IMPORTANT: log the callback BEFORE confirming to the caller, so a \
+mid-sentence hangup doesn't lose the request.
+4. The tool's response will tell you exactly what to say back to the \
+caller. Read that confirmation faithfully (don't paraphrase the wording). \
+After confirming, ask "Anything else I can help with?"
 
 # Transferring (available branch)
 When you call transfer_call, pass the conference join number that the \
@@ -202,7 +202,7 @@ async def get_agent(env: AgentEnv, call_request: CallRequest):
         api_key=os.environ.get("GEMINI_API_KEY"),
         tools=[
             make_escalate_tool(call_request),
-            make_linear_tool(call_request),
+            make_slack_ticket_tool(call_request),
             transfer_call,
             end_call,
         ],
