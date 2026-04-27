@@ -72,24 +72,40 @@ def make_escalate_tool(call_request: CallRequest):
           - "unavailable" — nobody picked up. Proceed to ask the caller for
             a callback number and call create_callback_ticket.
         """
+        demo_mode = (
+            os.environ.get("DEMO_MODE", "").strip().lower() in ("1", "true", "yes")
+        )
+
+        # Always fire the Slack call-ping (in BOTH demo and real mode) so the
+        # team always gets a heads-up that the bot escalated, regardless of
+        # whether a probe actually placed phone calls.
+        slack_url = os.environ.get("SLACK_WEBHOOK_URL", "")
+        if slack_url:
+            task = asyncio.create_task(
+                _send_slack_ping(slack_url, intent_summary, caller_number, demo_mode)
+            )
+            _pending_bg_tasks.add(task)
+            task.add_done_callback(_pending_bg_tasks.discard)
+
         # Demo mode: skip Twilio entirely, simulate "nobody answered" so the
         # flow exercises the email-fallback branch. Lets us run `cartesia
-        # chat` in a browser with zero telephony infrastructure.
-        if os.environ.get("DEMO_MODE", "").strip().lower() in ("1", "true", "yes"):
+        # chat` in a browser with zero telephony infrastructure. The 5-second
+        # sleep gives the caller a realistic-feeling "trying to reach the
+        # team" pause.
+        if demo_mode:
             logger.info(
                 "DEMO_MODE: simulating probe for call_id=%s (intent=%r) — "
-                "sleeping briefly then returning unavailable",
+                "sleeping ~5s then returning unavailable",
                 call_id,
                 intent_summary,
             )
-            await asyncio.sleep(2)
+            await asyncio.sleep(5)
             return "unavailable"
 
         twilio_sid = _env("TWILIO_ACCOUNT_SID")
         twilio_token = _env("TWILIO_AUTH_TOKEN")
         from_number = _env("TWILIO_FROM_NUMBER")
         conf_name = os.environ.get("CONFERENCE_NAME", "bc-active")
-        slack_url = os.environ.get("SLACK_WEBHOOK_URL", "")
 
         cells = [c for c in (os.environ.get("TAYLOR_CELL"), os.environ.get("ARYAMAAN_CELL")) if c]
         if not cells:
@@ -97,14 +113,6 @@ def make_escalate_tool(call_request: CallRequest):
             return "unavailable"
 
         client = Client(twilio_sid, twilio_token)
-
-        # Fire Slack ping in the background — don't block the probe on it.
-        if slack_url:
-            task = asyncio.create_task(
-                _send_slack_ping(slack_url, intent_summary, caller_number, conf_name)
-            )
-            _pending_bg_tasks.add(task)
-            task.add_done_callback(_pending_bg_tasks.discard)
 
         probe_twiml = _build_probe_twiml(intent_summary, conf_name)
 
@@ -221,21 +229,30 @@ def _cancel_call(client, sid: str) -> None:
 
 
 async def _send_slack_ping(
-    webhook_url: str, intent_summary: str, caller_number: str, conf_name: str
+    webhook_url: str, intent_summary: str, caller_number: str, demo_mode: bool
 ) -> None:
-    message = {
-        "text": (
+    """Heads-up to the team that the bot just escalated. Fires in BOTH demo
+    and real modes — the only difference is the message content (real-mode
+    says phones are ringing; demo-mode says no probe was placed)."""
+    if demo_mode:
+        body = (
+            f":telephone_receiver: *Bot escalated (DEMO mode)*\n"
+            f"*Caller:* {caller_number}\n"
+            f"*Wants:* {intent_summary}\n"
+            f"_No real probe placed — caller will be offered callback or "
+            f"email fallback._"
+        )
+    else:
+        body = (
             f":telephone_receiver: *Incoming Basic Capital call*\n"
             f"*Caller:* {caller_number}\n"
             f"*Wants:* {intent_summary}\n"
-            f"*Conference:* `{conf_name}` — your phone's ringing now. "
-            f"Answer to be placed in the room; auto-falls to ticket in "
-            f"~{PROBE_TIMEOUT_SECONDS}s."
+            f"_Phones ringing now — answer to be placed in the conference. "
+            f"Auto-falls to ticket in ~{PROBE_TIMEOUT_SECONDS}s._"
         )
-    }
     try:
         async with httpx.AsyncClient(timeout=5) as client:
-            await client.post(webhook_url, json=message)
+            await client.post(webhook_url, json={"text": body})
     except Exception as e:
         # Slack is best-effort; never let it block the call.
         logger.warning("Slack ping failed: %s", e)

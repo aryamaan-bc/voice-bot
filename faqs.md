@@ -104,6 +104,9 @@ A: No annual cap on rollovers from employer plans into Basic Capital. For IRA-to
 # 5. Withdrawals & distributions
 # ============================================================================
 
+Q: How do I withdraw money from my account?
+A: Depends a lot on your situation — happy to walk through it. Quick question first: are you still employed at the company that sponsors your plan, or have you left? That'll help me point you in the right direction.
+
 Q: What's the early withdrawal penalty?
 A: Ten percent on top of ordinary income tax, if you're under 59 and a half. There are specific exceptions — hardship, disability, first-time home purchase for IRAs.
 
