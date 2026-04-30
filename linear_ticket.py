@@ -107,16 +107,22 @@ async def _create_linear_ticket(
         )
         return None, None
 
+    # Cartesia's deep-link format uses query params (not path segments):
+    #   /agents/{agent_id}?tab=calls&call={ac_sid_xxx}
+    # The call_id we receive from CallRequest doesn't have the "ac_" prefix;
+    # the dashboard URL needs it.
+    dashboard_call_id = call_id if call_id.startswith("ac_") else f"ac_{call_id}"
     agent_id = os.environ.get("CARTESIA_AGENT_ID", "")
     if agent_id:
-        cartesia_url = (
-            f"https://play.cartesia.ai/agents/{agent_id}/calls/{call_id}"
+        deep_link = (
+            f"https://play.cartesia.ai/agents/{agent_id}"
+            f"?tab=calls&call={dashboard_call_id}"
         )
-        audio_line = f"**Audio + transcript:** {cartesia_url}"
+        audio_line = f"**Audio + transcript:** {deep_link}"
     else:
         audio_line = (
-            "**Audio + transcript:** in Cartesia dashboard "
-            "(set CARTESIA_AGENT_ID env var to get a direct link)"
+            "**Audio + transcript:** find this call in Cartesia's dashboard "
+            "(set CARTESIA_AGENT_ID env var to get a deep-link URL)"
         )
 
     description = (
@@ -127,7 +133,7 @@ async def _create_linear_ticket(
         f"**Recap:**\n{recap}\n\n"
         f"---\n\n"
         f"{audio_line}\n"
-        f"**Cartesia call ID:** `{call_id}`\n"
+        f"**Cartesia call ID:** `{dashboard_call_id}`\n"
     )
 
     title_caller = name_label if name_label != "didn't give a name" else "caller"
@@ -196,11 +202,16 @@ async def _send_slack_summary(
     else:
         ticket_line = "*Linear ticket:* (not created — Linear unconfigured/down)"
 
+    dashboard_call_id = call_id if call_id.startswith("ac_") else f"ac_{call_id}"
     agent_id = os.environ.get("CARTESIA_AGENT_ID", "")
-    audio_link = (
-        f"<https://play.cartesia.ai/agents/{agent_id}/calls/{call_id}|"
-        "audio + transcript>"
-    ) if agent_id else f"call ID `{call_id}`"
+    if agent_id:
+        deep_link = (
+            f"https://play.cartesia.ai/agents/{agent_id}"
+            f"?tab=calls&call={dashboard_call_id}"
+        )
+        audio_link = f"<{deep_link}|audio + transcript>"
+    else:
+        audio_link = f"call ID `{dashboard_call_id}`"
 
     body = {
         "text": f":memo: Call complete: {name_label} — {intent_summary}",
