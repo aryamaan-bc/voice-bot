@@ -1,20 +1,20 @@
-"""Escalate the call to a human via a Twilio conference-based probe.
+"""Escalate the call to a human via a single passthrough tool.
 
-Flow:
-  1. Slack ping to #bc-support with intent + caller number.
-  2. Outbound Twilio calls to Taylor and Aryamaan with inline TwiML that
-     announces the intent and drops them into a shared conference room.
-     Whoever answers first "wins" — they're already in the room, waiting.
-  3. Poll the Twilio Conference API for up to ~25s to see if anyone joined.
-  4. If joined → return 'available: <conf_name>' (the LLM then calls
-     transfer_call, which bridges the caller into the same conference —
-     no double-ring).
-  5. If nobody joined → end the pending outbound legs, return 'unavailable'
-     (the LLM then proceeds to create_callback_ticket).
+The tool handles the entire escalation flow itself:
+  1. Speaks an announcement to the caller (no LLM-text-before-tool race).
+  2. Fires a Slack call-ping to the team.
+  3. Runs the probe (real Twilio in production; 5s sleep in demo mode).
+  4. Speaks the outcome:
+       - Available: "Connecting you now" + AgentTransferCall.
+       - Unavailable: "Team is tied up — would you like a callback or to
+         email us?" Then the LLM handles the next steps (gathering name/
+         number, calling record_followup).
 
-Exposed as a factory (`make_escalate_tool(call_request)`) so the tool can
-close over the caller's number from the incoming CallRequest — Line's tool
-ctx is empty and doesn't carry call metadata.
+Why passthrough instead of loopback:
+  Gemini 2.5 Flash unreliably interleaves text generation with tool calls,
+  and unreliably calls multiple tools in sequence. Putting all the speech
+  INSIDE the tool — yielding AgentSendText events directly — sidesteps the
+  model's tool-calling quirks entirely.
 """
 
 import asyncio
@@ -23,26 +23,25 @@ import os
 from typing import Annotated, Optional
 
 import httpx
-from line.llm_agent.tools.decorators import loopback_tool
+from line.events import AgentSendText, AgentTransferCall
+from line.llm_agent.tools.decorators import passthrough_tool
 from line.voice_agent_app import CallRequest
 from twilio.rest import Client
 
+from linear_ticket import log_call_complete
+
 logger = logging.getLogger(__name__)
-
-
-# === Env-driven config (read lazily to avoid import-time failures) =========
-def _env(name: str, *, required: bool = True) -> str:
-    val = os.environ.get(name, "")
-    if required and not val:
-        raise RuntimeError(f"Missing required env var: {name}")
-    return val
 
 
 PROBE_TIMEOUT_SECONDS = 25  # upper bound on how long we wait for someone to answer
 POLL_INTERVAL_SECONDS = 1
 
-# Keep fire-and-forget tasks alive (asyncio GC can collect orphan tasks).
-_pending_bg_tasks: set[asyncio.Task] = set()
+
+def _env(name: str, *, required: bool = True) -> str:
+    val = os.environ.get(name, "")
+    if required and not val:
+        raise RuntimeError(f"Missing required env var: {name}")
+    return val
 
 
 def make_escalate_tool(call_request: CallRequest):
@@ -51,123 +50,175 @@ def make_escalate_tool(call_request: CallRequest):
     caller_number = call_request.from_ or "unknown"
     call_id = call_request.call_id
 
-    @loopback_tool
+    @passthrough_tool
     async def escalate_to_human(
         ctx,
+        spoken_announcement: Annotated[
+            str,
+            "The exact short sentence to speak to the caller BEFORE we "
+            "reach out to the team. Match the wording to the trigger. "
+            "Examples: 'Yeah, that's account-specific so I'd want to get "
+            "someone on our team — give me one moment to reach out.' / "
+            "'I can't give personal advice on this call, but let me try "
+            "grabbing someone on our team — hang on one moment.' / "
+            "'Of course — let me try reaching our team for you. One "
+            "moment.' / 'Hmm, that's not something I can answer myself, "
+            "but our team can — let me try them. Hang on one moment.'",
+        ],
         intent_summary: Annotated[
             str,
-            "One sentence, in the caller's own words, describing what they "
-            "want. Example: 'wants to know if she can roll over a SEP-IRA "
-            "from Fidelity.'",
+            "One sentence, in the caller's own words, describing what "
+            "they want. Used in the Slack notification to the team.",
         ],
-    ) -> str:
-        """Try to reach Taylor or Aryamaan via a conference-based probe.
+    ):
+        """Reach out to the team for help with this caller. Handles
+        everything end-to-end: speaks an announcement, pings the team via
+        Slack, runs the probe, and speaks the outcome to the caller.
 
-        Returns either:
-          - "available: <conference_name>" — someone answered and is waiting
-            in the conference. You should immediately say a short line like
-            "Connecting you now" and then call transfer_call with the
-            CONFERENCE_JOIN_NUMBER (from env) as the target — that bridges
-            the caller into the conference.
-          - "unavailable" — nobody picked up. Proceed to ask the caller for
-            a callback number and call create_callback_ticket.
+        After this tool finishes, the caller has been told either:
+          - The call is being transferred (and AgentTransferCall has fired)
+          - The team is tied up — would they prefer callback or email?
+
+        For the unavailable path, your next job is to wait for the
+        caller's response, ask for their name (and phone number if they
+        chose callback), then call record_followup.
         """
+        logger.info(
+            "escalate_to_human START call_id=%s intent=%r", call_id, intent_summary
+        )
+
+        # Step 1 — announce to the caller. interruptible=False so the
+        # caller hears the full sentence before the silent probe pause.
+        yield AgentSendText(text=spoken_announcement, interruptible=False)
+
+        # Step 2 — fire the team Slack ping. AWAITED so it can't be silently
+        # dropped (this was a bug previously when it was fire-and-forget).
         demo_mode = (
             os.environ.get("DEMO_MODE", "").strip().lower() in ("1", "true", "yes")
         )
-
-        # Always fire the Slack call-ping (in BOTH demo and real mode) so the
-        # team always gets a heads-up that the bot escalated, regardless of
-        # whether a probe actually placed phone calls.
         slack_url = os.environ.get("SLACK_WEBHOOK_URL", "")
         if slack_url:
-            task = asyncio.create_task(
-                _send_slack_ping(slack_url, intent_summary, caller_number, demo_mode)
-            )
-            _pending_bg_tasks.add(task)
-            task.add_done_callback(_pending_bg_tasks.discard)
+            try:
+                await _send_slack_ping(
+                    slack_url, intent_summary, caller_number, demo_mode
+                )
+            except Exception as e:
+                logger.warning("Slack ping failed (non-fatal): %s", e)
+        else:
+            logger.warning("SLACK_WEBHOOK_URL not set — no team ping fired")
 
-        # Demo mode: skip Twilio entirely, simulate "nobody answered" so the
-        # flow exercises the email-fallback branch. Lets us run `cartesia
-        # chat` in a browser with zero telephony infrastructure. The 5-second
-        # sleep gives the caller a realistic-feeling "trying to reach the
-        # team" pause.
+        # Step 3 — run the probe.
         if demo_mode:
-            logger.info(
-                "DEMO_MODE: simulating probe for call_id=%s (intent=%r) — "
-                "sleeping ~5s then returning unavailable",
-                call_id,
-                intent_summary,
-            )
+            logger.info("DEMO_MODE: sleeping ~5s, then unavailable")
             await asyncio.sleep(5)
-            return "unavailable"
+            available = False
+        else:
+            available = await _real_probe(intent_summary, call_id)
 
-        twilio_sid = _env("TWILIO_ACCOUNT_SID")
-        twilio_token = _env("TWILIO_AUTH_TOKEN")
-        from_number = _env("TWILIO_FROM_NUMBER")
-        conf_name = os.environ.get("CONFERENCE_NAME", "bc-active")
-
-        cells = [c for c in (os.environ.get("TAYLOR_CELL"), os.environ.get("ARYAMAAN_CELL")) if c]
-        if not cells:
-            logger.error("No hunt-group cells configured (TAYLOR_CELL / ARYAMAAN_CELL)")
-            return "unavailable"
-
-        client = Client(twilio_sid, twilio_token)
-
-        probe_twiml = _build_probe_twiml(intent_summary, conf_name)
-
-        # Place the outbound probe calls. Run the sync Twilio SDK in a thread
-        # pool so we don't block the event loop.
-        try:
-            call_sids = await asyncio.gather(
-                *[
-                    asyncio.to_thread(
-                        _place_probe_call,
-                        client,
-                        cell,
-                        from_number,
-                        probe_twiml,
-                    )
-                    for cell in cells
-                ]
+        # Step 4 — speak the outcome.
+        if available:
+            # Log to Linear FIRST, before the transfer kills the agent.
+            # Once AgentTransferCall fires, we have no chance to log.
+            await log_call_complete(
+                call_id=call_id,
+                caller_number=caller_number,
+                caller_name=None,  # we don't ask before transferring
+                intent_summary=intent_summary,
+                outcome="transferred",
+                recap=(
+                    f"Caller was bridged to a human after escalation. "
+                    f"Intent: {intent_summary}"
+                ),
             )
-        except Exception as e:
-            logger.exception("Failed to place probe calls: %s", e)
-            return "unavailable"
-
-        logger.info(
-            "Probe calls placed for call_id=%s: %s", call_id, dict(zip(cells, call_sids))
-        )
-
-        # Poll the conference for participants.
-        joined = await _wait_for_participant(client, conf_name, PROBE_TIMEOUT_SECONDS)
-
-        if joined:
-            logger.info("Probe succeeded for call_id=%s — human in %s", call_id, conf_name)
-            return f"available: {conf_name}"
-
-        # Nobody answered — cancel the ringing outbound legs so we don't keep
-        # ringing their phones after the caller has moved on to the ticket flow.
-        await asyncio.gather(
-            *[asyncio.to_thread(_cancel_call, client, sid) for sid in call_sids if sid],
-            return_exceptions=True,
-        )
-        logger.info("Probe timed out for call_id=%s", call_id)
-        return "unavailable"
+            yield AgentSendText(
+                text="Looks like someone's available — connecting you now.",
+                interruptible=False,
+            )
+            target = os.environ.get("CONFERENCE_JOIN_NUMBER", "")
+            if target:
+                yield AgentTransferCall(target_phone_number=target)
+            else:
+                logger.error(
+                    "Probe succeeded but CONFERENCE_JOIN_NUMBER unset — "
+                    "can't transfer. Falling through to ticket flow."
+                )
+                yield AgentSendText(
+                    text=(
+                        "Actually, looks like our team's tied up after all. "
+                        "I can take your name and a callback number to have "
+                        "someone follow up within one business day, or you "
+                        "can email support at basic capital dot com if "
+                        "that's easier — which works better for you?"
+                    ),
+                    interruptible=False,
+                )
+        else:
+            yield AgentSendText(
+                text=(
+                    "Looks like our team is tied up right now. I can take "
+                    "your name and a callback number to have someone follow "
+                    "up within one business day, or you can email support "
+                    "at basic capital dot com if that's easier — which "
+                    "works better for you?"
+                ),
+                interruptible=False,
+            )
 
     return escalate_to_human
 
 
-# ── helpers ────────────────────────────────────────────────────────────────
+# === Real-mode probe (Twilio conference) ====================================
+
+
+async def _real_probe(intent_summary: str, call_id: str) -> bool:
+    """Place outbound probe calls and poll the conference for participants.
+    Returns True if a human joined the conference, False otherwise."""
+    twilio_sid = _env("TWILIO_ACCOUNT_SID")
+    twilio_token = _env("TWILIO_AUTH_TOKEN")
+    from_number = _env("TWILIO_FROM_NUMBER")
+    conf_name = os.environ.get("CONFERENCE_NAME", "bc-active")
+
+    cells = [
+        c
+        for c in (os.environ.get("TAYLOR_CELL"), os.environ.get("ARYAMAAN_CELL"))
+        if c
+    ]
+    if not cells:
+        logger.error("No hunt-group cells configured — falling through")
+        return False
+
+    client = Client(twilio_sid, twilio_token)
+    probe_twiml = _build_probe_twiml(intent_summary, conf_name)
+
+    try:
+        call_sids = await asyncio.gather(
+            *[
+                asyncio.to_thread(
+                    _place_probe_call, client, cell, from_number, probe_twiml
+                )
+                for cell in cells
+            ]
+        )
+    except Exception as e:
+        logger.exception("Failed to place probe calls: %s", e)
+        return False
+
+    logger.info("Probe calls placed for call_id=%s", call_id)
+    joined = await _wait_for_participant(client, conf_name, PROBE_TIMEOUT_SECONDS)
+
+    if not joined:
+        # Cancel ringing legs so we don't keep ringing after the caller
+        # has moved on to the ticket flow.
+        await asyncio.gather(
+            *[asyncio.to_thread(_cancel_call, client, sid) for sid in call_sids if sid],
+            return_exceptions=True,
+        )
+        return False
+
+    return True
 
 
 def _build_probe_twiml(intent_summary: str, conf_name: str) -> str:
-    """Inline TwiML for the outbound probe. Announces the call, then drops
-    the answerer into the conference. endConferenceOnExit=false on the
-    human side means the conference survives if they disconnect first;
-    startConferenceOnEnter=true so the conference is live as soon as they
-    join (the caller-side joiner uses startConferenceOnEnter=true too)."""
-    # Basic XML escaping for the intent summary.
     safe_intent = (
         intent_summary.replace("&", "&amp;")
         .replace("<", "&lt;")
@@ -184,7 +235,6 @@ def _build_probe_twiml(intent_summary: str, conf_name: str) -> str:
 
 
 def _place_probe_call(client, to_number: str, from_number: str, twiml: str) -> Optional[str]:
-    """Place one outbound probe call. Returns the Call SID, or None on failure."""
     try:
         call = client.calls.create(to=to_number, from_=from_number, twiml=twiml)
         return call.sid
@@ -194,8 +244,6 @@ def _place_probe_call(client, to_number: str, from_number: str, twiml: str) -> O
 
 
 async def _wait_for_participant(client, conf_name: str, timeout_s: int) -> bool:
-    """Poll the Twilio Conference for participants; return True as soon as
-    the conference has at least one active participant."""
     deadline = asyncio.get_event_loop().time() + timeout_s
     while asyncio.get_event_loop().time() < deadline:
         try:
@@ -203,56 +251,49 @@ async def _wait_for_participant(client, conf_name: str, timeout_s: int) -> bool:
             if participants:
                 return True
         except Exception as e:
-            # Transient: conference may not exist yet until someone joins.
             logger.debug("Participant poll error (ignorable): %s", e)
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
     return False
 
 
 def _list_participants(client, conf_name: str) -> list:
-    """Return active participants in the named conference. Twilio resolves
-    conferences by FriendlyName; filter to in-progress ones only."""
-    confs = list(client.conferences.list(friendly_name=conf_name, status="in-progress", limit=5))
+    confs = list(
+        client.conferences.list(friendly_name=conf_name, status="in-progress", limit=5)
+    )
     if not confs:
         return []
-    # Grab the most recent in-progress conference with this name.
     conf = confs[0]
     return list(client.conferences(conf.sid).participants.list(limit=5))
 
 
 def _cancel_call(client, sid: str) -> None:
-    """Best-effort cancel of a ringing outbound leg."""
     try:
         client.calls(sid).update(status="canceled")
     except Exception as e:
         logger.debug("Could not cancel call %s: %s", sid, e)
 
 
+# === Slack call-ping =========================================================
+
+
 async def _send_slack_ping(
     webhook_url: str, intent_summary: str, caller_number: str, demo_mode: bool
 ) -> None:
-    """Heads-up to the team that the bot just escalated. Fires in BOTH demo
-    and real modes — the only difference is the message content (real-mode
-    says phones are ringing; demo-mode says no probe was placed)."""
     if demo_mode:
         body = (
             f":telephone_receiver: *Bot escalated (DEMO mode)*\n"
             f"*Caller:* {caller_number}\n"
             f"*Wants:* {intent_summary}\n"
-            f"_No real probe placed — caller will be offered callback or "
-            f"email fallback._"
+            f"_No real probe — caller will be offered callback or email._"
         )
     else:
         body = (
             f":telephone_receiver: *Incoming Basic Capital call*\n"
             f"*Caller:* {caller_number}\n"
             f"*Wants:* {intent_summary}\n"
-            f"_Phones ringing now — answer to be placed in the conference. "
-            f"Auto-falls to ticket in ~{PROBE_TIMEOUT_SECONDS}s._"
+            f"_Phones ringing now — answer to be placed in the conference._"
         )
-    try:
-        async with httpx.AsyncClient(timeout=5) as client:
-            await client.post(webhook_url, json={"text": body})
-    except Exception as e:
-        # Slack is best-effort; never let it block the call.
-        logger.warning("Slack ping failed: %s", e)
+    async with httpx.AsyncClient(timeout=5) as client:
+        resp = await client.post(webhook_url, json={"text": body})
+    resp.raise_for_status()
+    logger.info("Slack ping sent (status=%s)", resp.status_code)
