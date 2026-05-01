@@ -44,8 +44,15 @@ def _env(name: str, *, required: bool = True) -> str:
     return val
 
 
-def make_escalate_tool(call_request: CallRequest):
-    """Build the escalate_to_human tool bound to this call's CallRequest."""
+def make_escalate_tool(call_request: CallRequest, completed_flag=None):
+    """Build the escalate_to_human tool bound to this call's CallRequest.
+
+    `completed_flag` is the same single-element list shared with
+    end_call_with_goodbye and the CallEnded wrapper in main.get_agent.
+    The transfer-success path here logs to Linear and then ends the call
+    via AgentTransferCall, which fires CallEnded — set the flag so the
+    wrapper doesn't double-log an "abandoned" ticket.
+    """
 
     caller_number = call_request.from_ or "unknown"
     call_id = call_request.call_id
@@ -130,6 +137,8 @@ def make_escalate_tool(call_request: CallRequest):
                     f"Intent: {intent_summary}"
                 ),
             )
+            if completed_flag is not None:
+                completed_flag[0] = True
             yield AgentSendText(
                 text="Looks like someone's available — connecting you now.",
                 interruptible=False,

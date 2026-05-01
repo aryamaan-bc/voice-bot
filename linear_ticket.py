@@ -36,6 +36,7 @@ Outcome = Literal[
     "email_logged",
     "transferred",
     "closed_hours",
+    "abandoned",
     "other",
 ]
 
@@ -45,6 +46,7 @@ _OUTCOME_LABELS = {
     "email_logged": "Email follow-up expected",
     "transferred": "Transferred to human",
     "closed_hours": "Hit closed-hours message",
+    "abandoned": "Caller hung up mid-call",
     "other": "Other",
 }
 

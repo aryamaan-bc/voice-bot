@@ -13,6 +13,7 @@ from line.agent import TurnEnv
 from line.events import (
     AgentEndCall,
     AgentSendText,
+    CallEnded,
     CallStarted,
     InputEvent,
     OutputEvent,
@@ -26,7 +27,7 @@ from linear_ticket import log_call_complete
 from slack_ticket import make_followup_tool
 
 
-def make_end_call_tool(call_request: CallRequest):
+def make_end_call_tool(call_request: CallRequest, completed_flag=None):
     """Factory for the end-call-with-goodbye tool, bound to this call.
 
     Why this is a factory (and why we don't use line.llm_agent.end_call):
@@ -35,6 +36,11 @@ def make_end_call_tool(call_request: CallRequest):
         goodbye, hanging up silently. We wrap it.
       - Closing over call_request lets the tool log to Linear with the
         correct call_id and caller_number — Line's tool ctx is empty.
+
+    If completed_flag is provided (a single-element list used as a mutable
+    closure cell), the tool sets completed_flag[0] = True when it fires.
+    The CallEnded wrapper in get_agent uses this to detect calls that
+    ended cleanly vs callers who hung up mid-call.
     """
     call_id = call_request.call_id
     caller_number = call_request.from_ or "unknown"
@@ -94,6 +100,8 @@ def make_end_call_tool(call_request: CallRequest):
             outcome=outcome,
             recap=recap,
         )
+        if completed_flag is not None:
+            completed_flag[0] = True
         yield AgentSendText(text=farewell, interruptible=False)
         yield AgentEndCall(interruptible=False)
 
@@ -148,22 +156,41 @@ something heavy (job loss, hardship, market losses), one brief beat of \
 acknowledgement before the answer ("yeah, that's a fair question") — \
 then help.
 
-# Pronunciation — IMPORTANT
-The TTS mispronounces digits if you write them naively. ALWAYS use these \
-spoken forms in your responses, even if the caller used a different form:
+# Pronunciation — IMPORTANT (spoken vs written)
+The TTS mispronounces digits naively, so SPOKEN text uses phonetic forms. \
+But Linear tickets and Slack DMs are READ by humans in writing — those \
+should use the digit/abbreviation form, not the phonetic spelling.
 
-- 401k / 401(k) / four-oh-one-K → ALWAYS write/say **four-oh-one K** \
-(never "four hundred one K", never "four oh one K plan number", never \
-"401(k)")
-- 1099-R → "ten ninety-nine R"
-- 5498 → "five four nine eight"
-- 59½ → "fifty-nine and a half"
-- IRA → "I R A" (each letter, not "Ira")
-- ACAT → "A-CAT"
+  | Term            | SPOKEN (caller hears)     | WRITTEN (Linear/Slack) |
+  | --------------- | ------------------------- | ---------------------- |
+  | 401(k)          | four-oh-one K             | 401k                   |
+  | 1099-R          | ten ninety-nine R         | 1099-R                 |
+  | 5498            | five four nine eight      | 5498                   |
+  | 59½             | fifty-nine and a half     | 59½                    |
+  | IRA             | I R A (each letter)       | IRA                    |
+  | ACAT            | A-CAT                     | ACAT                   |
 
-If the caller says "my 401k" or "my four-oh-one-K", you respond with \
-"four-oh-one K" in your reply — match the spoken form, not the digit \
-form. The FAQ below already uses these spoken forms.
+**Rule of thumb:**
+- Anything you SPEAK to the caller → phonetic form ("four-oh-one K")
+- Tool parameters that get logged (intent_summary, recap, caller_name) \
+→ digit/written form ("401k")
+
+The FAQ below uses phonetic forms because that text gets spoken. When \
+you write a `recap` or `intent_summary` for record_followup or \
+end_call_with_goodbye, translate back to the digit form so Will and \
+the ops team see clean text in Linear/Slack.
+
+Example for end_call_with_goodbye after a 401k contribution call:
+- farewell="Thanks for calling Basic Capital — have a great one!" (will \
+be spoken, so phonetic context-free here)
+- intent_summary="wanted to know the 401k contribution limit" (written, \
+use 401k)
+- recap="Caller asked about the 2026 401k contribution limit. I gave \
+the IRS figures: $24,500 standard… they were satisfied." (written, use \
+401k and dollar signs, not phonetic)
+
+If the caller says "my 401k" or "my four-oh-one K", respond verbally \
+with "four-oh-one K" — match the spoken form for speech.
 
 # Answering from the FAQ
 Match the caller's question (however worded) to a relevant FAQ topic and \
@@ -250,8 +277,7 @@ Escalate ONLY when:
 for me…", "will I owe taxes…")
 3. The caller explicitly asks for a human ("agent", "person", \
 "representative", "talk to someone")
-4. The caller asks if you're a bot, AI, automated
-5. The question is a LEGITIMATE Basic Capital question but has no \
+4. The question is a LEGITIMATE Basic Capital question but has no \
 matching FAQ topic, even with generous interpretation
 
 Otherwise, answer from the FAQ. Escalation is the EXCEPTION, not the \
@@ -329,8 +355,26 @@ IMPORTANT: call record_followup BEFORE the confirmation speech, so a \
 mid-sentence hangup doesn't lose the request.
 
 # Bot identity
-If asked whether you're real, a bot, an AI, automated — DO NOT confirm \
-or deny. Treat as an "I want a human" trigger and escalate.
+If asked whether you're a bot, AI, automated, or real, BE TRUTHFUL. \
+Confirm you're an AI customer support specialist for Basic Capital, \
+then reassure the caller you can help with most general questions and \
+offer to connect them with a human if they prefer. Don't escalate just \
+because they asked — only escalate if they actually say they want a \
+human after your reply.
+
+Example phrasings (vary naturally — these are NOT scripts to read \
+verbatim):
+- "Yeah, I'm an AI customer support specialist for Basic Capital — but \
+I can answer most general questions about accounts, contributions, \
+rollovers, and the like. Or if you'd prefer to talk to someone on our \
+team, just say the word."
+- "I am — I'm Basic Capital's AI customer support specialist. I can \
+handle most general questions, but happy to connect you with a human \
+if you'd rather. What works for you?"
+
+If they then say they want a human, escalate via escalate_to_human \
+following the rules above. If they say they're fine continuing with \
+you, just keep going.
 
 # Wrapping up — IMPORTANT: log the call before goodbye
 
@@ -484,19 +528,54 @@ async def get_agent(env: AgentEnv, call_request: CallRequest):
     logger.info(
         "Call %s from %s — serving main agent", call_request.call_id, call_request.from_
     )
-    return LlmAgent(
+
+    # Single-element list as a mutable closure cell shared between the
+    # tools that end a call cleanly (end_call_with_goodbye, the transfer
+    # branch of escalate_to_human) and the CallEnded wrapper below. If
+    # CallEnded fires while completed[0] is still False, the caller hung
+    # up mid-call — log an "abandoned" ticket so it doesn't disappear.
+    completed = [False]
+
+    llm_agent = LlmAgent(
         model="anthropic/claude-haiku-4-5",
         api_key=os.environ.get("ANTHROPIC_API_KEY"),
         tools=[
-            make_escalate_tool(call_request),
+            make_escalate_tool(call_request, completed_flag=completed),
             make_followup_tool(call_request),
-            make_end_call_tool(call_request),
+            make_end_call_tool(call_request, completed_flag=completed),
         ],
         config=LlmConfig(
             system_prompt=SYSTEM_PROMPT,
             introduction=GREETING,
         ),
     )
+
+    call_id = call_request.call_id
+    caller_number = call_request.from_ or "unknown"
+
+    async def agent_with_abandoned_logging(
+        turn_env: TurnEnv, event: InputEvent
+    ) -> AsyncIterable[OutputEvent]:
+        if isinstance(event, CallEnded) and not completed[0]:
+            logger.info("Call %s ended without clean wrap — logging abandoned", call_id)
+            await log_call_complete(
+                call_id=call_id,
+                caller_number=caller_number,
+                caller_name=None,
+                intent_summary="Caller hung up mid-call",
+                outcome="abandoned",
+                recap=(
+                    "Caller disconnected before the call wrapped up cleanly — "
+                    "no goodbye, no transfer, no follow-up was logged. Audio "
+                    "and full transcript are in the Cartesia dashboard."
+                ),
+            )
+            completed[0] = True
+            return
+        async for output in llm_agent.process(turn_env, event):
+            yield output
+
+    return agent_with_abandoned_logging
 
 
 app = VoiceAgentApp(get_agent=get_agent)

@@ -1,26 +1,29 @@
 # Basic Capital FAQ Voice Agent
 
-A voice bot that answers FAQs about Basic Capital, transfers to a human when
-one's available, and creates a Linear callback ticket when nobody picks up.
+Phone bot that answers general Basic Capital questions, transfers callers to a
+human when one's available, and falls back to a callback or email follow-up
+when the team is tied up. Every call ends with a Linear ticket + Slack DM so
+ops has a written record (including for callers who hang up mid-call).
 
 ## Stack
 
 - **Cartesia Line** — agent framework (Sonic-3 TTS + Ink-Whisper STT + orchestration)
-- **Twilio** — phone numbers + simul-ring hunt group
-- **Anthropic Claude Haiku** — LLM
-- **Linear** — callback tickets
-- **Slack** — incoming-call pings to the support team
+- **Twilio** — phone number + simul-ring hunt group + conference bridge
+- **Anthropic Claude Haiku 4.5** — LLM (via LiteLLM)
+- **Linear** — per-call ops tickets
+- **Slack** — incoming-call pings, follow-up requests, post-call summaries
 
 ## Files
 
 ```
-bc-faq-agent/
-├── main.py                # Agent entry point
-├── faqs.md                # FAQ knowledge base ← FILL THIS IN
-├── tools/
-│   ├── escalation.py      # escalate_to_human (simul-ring + slack ping)
-│   └── linear.py          # create_callback_ticket
-├── twilio_huntgroup.xml   # TwiML for the hunt group (paste into TwiML Bin)
+voice-bot1/
+├── main.py                # Entry point: get_agent, system prompt, business-hours gate
+├── faqs.md                # FAQ knowledge base (loaded at container start)
+├── escalation.py          # escalate_to_human (announce → Slack ping → probe → outcome)
+├── slack_ticket.py        # record_followup (callback / email logging)
+├── linear_ticket.py       # log_call_complete (Linear ticket + Slack post-call summary)
+├── twilio_huntgroup.xml   # TwiML for the conference-join number
+├── cartesia.toml          # Agent ID (set by `cartesia init`)
 ├── pyproject.toml
 ├── .env.example           # Copy to .env, fill in
 └── README.md
@@ -28,14 +31,14 @@ bc-faq-agent/
 
 ## Setup (one time)
 
-### 1. Accounts you need
+### 1. Accounts
 
-- [Cartesia](https://cartesia.ai) — get API key
-- [Twilio](https://twilio.com) — buy two phone numbers (~$2/mo total):
+- [Cartesia](https://cartesia.ai) — API key, `cartesia auth login`
+- [Twilio](https://twilio.com) — two phone numbers (~$2/mo total):
   - Main number (callers dial this)
-  - Hunt group number (internal, never published)
-- [Anthropic](https://console.anthropic.com) — API key
-- [Linear](https://linear.app/settings/api) — API key + team ID
+  - Conference-join number (internal — Cartesia transfers the caller here)
+- [Anthropic](https://console.anthropic.com) — API key (`sk-ant-…`)
+- [Linear](https://linear.app/settings/api) — API key + team UUID
 - [Slack](https://api.slack.com/apps) — incoming webhook URL
 
 ### 2. Twilio configuration
@@ -43,109 +46,128 @@ bc-faq-agent/
 1. **Buy two numbers** in the Twilio console.
 2. **Create a TwiML Bin** (Console → Runtime → TwiML Bins → Create new):
    - Paste the contents of `twilio_huntgroup.xml`
-   - Replace the placeholder phone numbers with Taylor + Aryamaan's cells
-   - Replace `callerId` with your main BC Twilio number
-   - Save, copy the TwiML Bin URL
-3. **Configure the hunt-group number's voice webhook** to point at the TwiML Bin URL.
-4. **Configure the main number's voice webhook** to point at Cartesia (the
-   Cartesia dashboard provides this URL when you attach the number).
+   - Replace placeholder cells with Taylor's + Aryamaan's numbers
+   - Save and copy the TwiML Bin URL
+3. **Conference-join number's voice webhook** → that TwiML Bin URL
+4. **Main number's voice webhook** → the URL Cartesia gives you when you
+   attach the number in the Cartesia dashboard
 
 ### 3. Linear configuration
 
-1. Create a personal API key at https://linear.app/settings/api.
-2. Get your team's UUID:
+1. Personal API key at https://linear.app/settings/api (starts with `lin_api_`)
+2. Get the team UUID:
    ```bash
-   curl -H "Authorization: $LINEAR_API_KEY" \
+   curl -s -H "Authorization: $LINEAR_API_KEY" \
         -H "Content-Type: application/json" \
-        -d '{"query":"{teams{nodes{id name}}}"}' \
-        https://api.linear.app/graphql
+        -d '{"query":"{teams{nodes{id name key}}}"}' \
+        https://api.linear.app/graphql | python3 -m json.tool
    ```
-3. (Optional but recommended) Create a dedicated Linear project for callbacks
-   so they don't pollute your main board.
+   Use the `id` (UUID), not the `key`.
+3. (Recommended) Create a dedicated project so call tickets don't pollute the
+   main board.
 
 ### 4. Slack configuration
 
-1. Go to https://api.slack.com/apps → Create New App → From scratch
-2. Enable "Incoming Webhooks"
-3. Add a webhook to your `#bc-support` channel (create the channel first)
-4. Copy the webhook URL
+1. https://api.slack.com/apps → Create New App → From scratch
+2. Enable "Incoming Webhooks" and add one to your `#bc-support` channel (or
+   your own DM for testing)
+3. Copy the webhook URL — same URL handles all three message types
+   (live-call ping, follow-up logging, post-call summary)
 
 ## Local development
 
 ```bash
-# Install Cartesia CLI
 pip install cartesia
-
-# Authenticate
 cartesia auth login
-
-# Install deps
 pip install -e .
 
-# Set up environment
 cp .env.example .env
-# ... edit .env with real values
+# fill in real values; for browser-only testing set DEMO_MODE=true and
+# only ANTHROPIC_API_KEY is strictly required
 
-# Fill in faqs.md with the 19 FAQ Q/A pairs (copy from basiccapital.com/faq)
-
-# Test locally
-cartesia chat 8000
+cartesia chat 8000      # browser playground
 ```
 
 ## Deployment
 
 ```bash
-# Link this directory to a Cartesia agent (one time)
-cartesia init
-
-# Deploy
+cartesia init           # one time — links this dir to a Cartesia agent ID
 cartesia deploy
-
-# Watch logs
 cartesia logs --follow
 ```
 
+## Call flow
+
+1. **Greeting** — Alex introduces by name; mentions recording + that personal
+   advice goes to a human; asks how to help.
+2. **FAQ match** — answers from `faqs.md` in 1–2 sentences, then asks if the
+   caller needs anything else.
+3. **Escalation** (account-specific / advice / "I want a human" / off-FAQ) —
+   `escalate_to_human` announces, Slack-pings the team, probes the hunt group:
+   - **Available** → Linear ticket (`outcome=transferred`) + `AgentTransferCall`
+   - **Unavailable** → Alex offers callback or email; `record_followup` logs
+     it; `end_call_with_goodbye` wraps with `outcome=callback_logged` /
+     `email_logged`
+4. **Off-topic** — one polite redirect; second off-topic question →
+   `end_call_with_goodbye(outcome=other)`
+5. **Caller hangs up mid-call** — `CallEnded` wrapper logs
+   `outcome=abandoned` so it still shows up in Linear/Slack
+6. **Outside business hours** — closed-hours agent plays a recorded message,
+   logs `outcome=closed_hours`, hangs up (no LLM, no team ring)
+
 ## Testing checklist
 
-After deploying, call your main BC Twilio number from your cell. Test each
-branch:
+Call your main BC Twilio number and verify:
 
-- [ ] **FAQ question** ("Are there annual contribution limits?") → bot answers
-      from the FAQ
-- [ ] **Off-FAQ question** with hunt group answering → bot says it's getting a
-      human, your test phone rings, you pick up, you're on the call with the
-      original caller
-- [ ] **Off-FAQ question** with hunt group not answering → bot waits 30s, then
-      asks for callback number, creates a Linear ticket, reads back the ticket
-      ID
-- [ ] **Slack ping** fires in `#bc-support` whenever escalation happens
-- [ ] **Linear ticket** appears with intent summary as title and full
-      transcript in the description
-- [ ] **Caller hangup** mid-ticket-creation → ticket still gets created (check
-      Linear)
-- [ ] **Advice question** ("Should I roll over my 401k?") → bot deflects to
-      human, doesn't try to answer
+- [ ] **FAQ question** ("What's the 401(k) contribution limit?") → answered
+      from FAQ, asks "anything else?"
+- [ ] **Withdrawal flow** → asks IRA-or-401(k) clarifier, gives rules first,
+      then offers to connect for paperwork
+- [ ] **Account-specific** ("what's my balance?") → escalates without trying
+      to answer
+- [ ] **Advice question** ("should I do a Roth conversion?") → escalates with
+      compliance language
+- [ ] **Hunt group answers** → caller bridged, Linear ticket
+      (`outcome=transferred`) appears
+- [ ] **Hunt group times out** → callback or email path; Slack follow-up
+      message + Linear ticket land
+- [ ] **Caller hangs up mid-call** → Linear ticket with `outcome=abandoned`
+      (and the Cartesia deep-link plays back the audio)
+- [ ] **Off-topic** ("what's the weather?") → polite redirect; second
+      off-topic question ends the call cleanly
+- [ ] **"Are you a bot?"** → Alex confirms truthfully (AI customer support
+      specialist), offers to keep helping or transfer
+- [ ] **After hours** → closed-hours message, no LLM tokens spent
 
 ## Common issues
 
-- **Linear API auth fails**: header is `Authorization: lin_api_xxx`, NOT
-  `Bearer lin_api_xxx`.
-- **Phone numbers must be E.164**: `+14155551234`, not `(415) 555-1234`.
-- **TwiML Bin not firing**: check the hunt-group number's voice webhook is set
-  to the TwiML Bin URL, not a static file.
-- **Bot won't escalate**: tighten the system prompt — Haiku can be over-eager
-  to answer. Add explicit "if you're not 100% sure, escalate" language.
-- **Slack ping doesn't fire**: webhook URL is correct? Channel exists? App is
+- **Linear auth fails** — header is `Authorization: lin_api_xxx`, NOT
+  `Bearer lin_api_xxx`. The code already handles this.
+- **Cartesia deep-links 404** — URL must be `?tab=calls&call=ac_sid_xxx`
+  (query params, not path segments). Make sure `CARTESIA_AGENT_ID` is set.
+- **Bot says digits weirdly** ("four hundred and one k") — pronunciation
+  table in the system prompt has the spoken-vs-written forms; FAQ uses
+  phonetic ("four-oh-one K") for spoken text. Tool params (Linear/Slack)
+  should be the digit form ("401k").
+- **Bot speaks twice on hangup/escalation** — atomic-tool rule violated.
+  `escalate_to_human` and `end_call_with_goodbye` MUST be called with no
+  LLM-generated text in the same turn; the tool handles all speech.
+- **Browser `cartesia chat` stuck on "Active 0:00:00"** — known WebRTC
+  flakiness; phone path works fine. Just use the phone number for testing.
+- **Slack ping doesn't fire** — webhook URL set? Channel exists? App
   installed to the workspace?
 
 ## What's deliberately NOT in v1
 
-- 45-second relevance gate (gracefully end calls from spammers)
+- 45-second relevance gate (early-end on spam callers)
 - Distress detection
 - Spanish support
-- Account-specific lookups
-- Auto-toggle availability
-- Duplicate-ticket detection
-
-These are all in the memo's Evolution section. Add when you have data showing
-they're needed.
+- Account-specific lookups (always escalate)
+- Auto-toggle availability based on team status
+- Duplicate-ticket detection (per-call ticketing means duplicates ARE the
+  expected behavior — one ticket per call)
+- Retirement Mortgage explanations (legacy product, sunsetted, routes to
+  humans)
+- Prior-year contributions, ACAT/in-kind rollovers, 401(k) loans, catch-up
+  contributions — IRS allows these; BC doesn't operationally support them
+  yet. FAQs say so explicitly.
