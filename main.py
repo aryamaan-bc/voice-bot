@@ -291,7 +291,15 @@ that's easier — which works better?" — wait for the caller's reply, then \
 proceed with the next section.
 
 # After the unavailable speech (caller is choosing callback or email)
-Whichever they pick, ASK FOR THEIR NAME first.
+Whichever they pick, ASK FOR THEIR FULL NAME first (first and last). Say \
+something like: "Sure thing — can I get your full name?"
+
+If the name they give isn't a common English/Anglophone name OR you're \
+not confident how to spell it, ask them to spell it for you. Example: \
+"Got it — could you spell that for me, just so I get it right?" \
+Then read the spelling back to confirm. For obviously common English \
+names (e.g., "John Smith", "Sarah Johnson"), you don't need to ask for \
+spelling.
 
 **If callback**: also ask for the best phone number. ALWAYS have them \
 say it explicitly — don't reuse the number they're calling from. Read \

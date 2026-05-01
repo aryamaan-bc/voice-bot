@@ -32,8 +32,9 @@ def make_followup_tool(call_request: CallRequest):
         ctx,
         caller_name: Annotated[
             str,
-            "The caller's name as they gave it. Don't make this up — "
-            "ask the caller before calling this tool.",
+            "The caller's FULL name (first + last) as they gave it. "
+            "Confirm spelling with the caller for non-Anglophone names "
+            "before calling this tool. Don't make this up.",
         ],
         contact_method: Annotated[
             Literal["phone", "email"],
