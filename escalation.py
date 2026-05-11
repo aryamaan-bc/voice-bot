@@ -33,8 +33,22 @@ from linear_ticket import log_call_complete
 logger = logging.getLogger(__name__)
 
 
-PROBE_TIMEOUT_SECONDS = 25  # upper bound on how long we wait for someone to answer
+PROBE_TIMEOUT_SECONDS = 40  # upper bound on how long we wait for someone to answer
 POLL_INTERVAL_SECONDS = 1
+
+# Filler audio played to the customer at ~10s intervals during the probe
+# wait, so they don't sit in 10+ seconds of pure silence and assume the
+# call dropped. Spoken in order; varied wording so it doesn't sound like
+# a loop. The list covers the full PROBE_TIMEOUT_SECONDS window — first
+# filler addresses "are you still there?" head-on so callers don't have
+# to ask.
+PROBE_FILLER_INTERVAL_SECONDS = 10
+PROBE_FILLERS = [
+    "Yep, still here — just reaching out to our team. One moment.",
+    "Bear with me — should just be another second.",
+    "Hang tight, almost there.",
+    "Really appreciate your patience — almost set.",
+]
 
 
 def _env(name: str, *, required: bool = True) -> str:
@@ -114,13 +128,33 @@ def make_escalate_tool(call_request: CallRequest, completed_flag=None):
         else:
             logger.warning("SLACK_WEBHOOK_URL not set — no team ping fired")
 
-        # Step 3 — run the probe.
+        # Step 3 — run the probe. Yield filler audio every
+        # PROBE_FILLER_INTERVAL_SECONDS so the customer hears something
+        # instead of dead silence while we wait for a teammate to pick up.
         if demo_mode:
             logger.info("DEMO_MODE: sleeping ~5s, then unavailable")
             await asyncio.sleep(5)
             available = False
         else:
-            available = await _real_probe(intent_summary, call_id)
+            probe_task = asyncio.create_task(_real_probe(call_id))
+            filler_idx = 0
+            while True:
+                try:
+                    available = await asyncio.wait_for(
+                        asyncio.shield(probe_task),
+                        timeout=PROBE_FILLER_INTERVAL_SECONDS,
+                    )
+                    break
+                except asyncio.TimeoutError:
+                    if filler_idx < len(PROBE_FILLERS) and not probe_task.done():
+                        yield AgentSendText(
+                            text=PROBE_FILLERS[filler_idx],
+                            interruptible=False,
+                        )
+                        filler_idx += 1
+                    # If we're out of fillers, just loop quietly until
+                    # probe_task completes (either picks up or times out
+                    # at PROBE_TIMEOUT_SECONDS).
 
         # Step 4 — speak the outcome.
         if available:
@@ -179,7 +213,7 @@ def make_escalate_tool(call_request: CallRequest, completed_flag=None):
 # === Real-mode probe (Twilio conference) ====================================
 
 
-async def _real_probe(intent_summary: str, call_id: str) -> bool:
+async def _real_probe(call_id: str) -> bool:
     """Place outbound probe calls and poll the conference for participants.
     Returns True if a human joined the conference, False otherwise."""
     twilio_sid = _env("TWILIO_ACCOUNT_SID")
@@ -197,7 +231,7 @@ async def _real_probe(intent_summary: str, call_id: str) -> bool:
         return False
 
     client = Client(twilio_sid, twilio_token)
-    probe_twiml = _build_probe_twiml(intent_summary, conf_name)
+    probe_twiml = _build_probe_twiml(conf_name)
 
     try:
         call_sids = await asyncio.gather(
@@ -227,16 +261,12 @@ async def _real_probe(intent_summary: str, call_id: str) -> bool:
     return True
 
 
-def _build_probe_twiml(intent_summary: str, conf_name: str) -> str:
-    safe_intent = (
-        intent_summary.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
-    )
+def _build_probe_twiml(conf_name: str) -> str:
+    # No Polly preamble: it ate ~5s of join time, which pushed past
+    # PROBE_TIMEOUT_SECONDS in testing. Slack already pings the responder
+    # with full intent context before they pick up.
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="Polly.Joanna">Call from Basic Capital. Caller wants to know: {safe_intent}. Connecting you now.</Say>
   <Dial>
     <Conference startConferenceOnEnter="true" endConferenceOnExit="true" beep="false">{conf_name}</Conference>
   </Dial>
