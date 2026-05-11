@@ -16,7 +16,15 @@ exports.handler = function (context, event, callback) {
   // (e.g. bc-voice-functions-1234.twil.io). Used to build an absolute
   // URL for our own recording-callback endpoint — relative paths don't
   // work as Twilio webhooks.
-  const callbackUrl = `https://${context.DOMAIN_NAME}/recording-callback`;
+  //
+  // event.From is the customer's phone number on the inbound transfer
+  // (the bot redirects them here via AgentTransferCall). We forward it
+  // through the recording callback so the post-call Slack DM can show
+  // who was on the call without ops having to dig in Twilio Console.
+  const customerNumber = event.From || '';
+  const callbackUrl =
+    `https://${context.DOMAIN_NAME}/recording-callback` +
+    `?customer=${encodeURIComponent(customerNumber)}`;
 
   const twiml = new Twilio.twiml.VoiceResponse();
   twiml.dial().conference(

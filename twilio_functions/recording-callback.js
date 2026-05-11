@@ -28,6 +28,7 @@ exports.handler = async function (context, event, callback) {
   const recordingUrl = event.RecordingUrl || '';
   const recordingSid = event.RecordingSid || '';
   const conferenceSid = event.ConferenceSid || 'n/a';
+  const customerNumber = event.customer || '(unknown)';
   const durationSec = parseInt(event.RecordingDuration, 10) || 0;
   const minutes = Math.floor(durationSec / 60);
   const seconds = durationSec % 60;
@@ -43,7 +44,7 @@ exports.handler = async function (context, event, callback) {
     : '(recording URL missing from callback)';
 
   const payload = {
-    text: `:tape: Conference recording ready — ${durationLabel}`,
+    text: `:tape: Conference recording ready — caller ${customerNumber} — ${durationLabel}`,
     blocks: [
       {
         type: 'header',
@@ -52,8 +53,8 @@ exports.handler = async function (context, event, callback) {
       {
         type: 'section',
         fields: [
+          { type: 'mrkdwn', text: `*Caller:*\n${customerNumber}` },
           { type: 'mrkdwn', text: `*Duration:*\n${durationLabel}` },
-          { type: 'mrkdwn', text: `*Conference SID:*\n\`${conferenceSid}\`` },
         ],
       },
       {
@@ -65,7 +66,10 @@ exports.handler = async function (context, event, callback) {
         elements: [
           {
             type: 'mrkdwn',
-            text: `Recording SID: \`${recordingSid}\`  ·  Direct mp3 (auth): ${directMp3}`,
+            text:
+              `Conference SID: \`${conferenceSid}\`  ·  ` +
+              `Recording SID: \`${recordingSid}\`  ·  ` +
+              `Direct mp3 (auth): ${directMp3}`,
           },
         ],
       },
