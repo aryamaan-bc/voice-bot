@@ -20,6 +20,7 @@ Why passthrough instead of loopback:
 import asyncio
 import logging
 import os
+import time
 from typing import Annotated, Optional
 
 import httpx
@@ -49,6 +50,17 @@ PROBE_FILLERS = [
     "Hang tight, almost there.",
     "Really appreciate your patience — almost set.",
 ]
+
+# Spoken on both the probe-failed path AND the misconfigured-target path
+# (probe succeeded but CONFERENCE_JOIN_NUMBER is empty — no destination
+# to transfer to). The LLM then handles the callback/email choice.
+TEAM_UNAVAILABLE_MESSAGE = (
+    "Looks like our team is tied up right now. I can take "
+    "your name and a callback number to have someone follow "
+    "up within one business day, or you can email support "
+    "at basic capital dot com if that's easier — which "
+    "works better for you?"
+)
 
 
 def _env(name: str, *, required: bool = True) -> str:
@@ -157,9 +169,19 @@ def make_escalate_tool(call_request: CallRequest, completed_flag=None):
                     # at PROBE_TIMEOUT_SECONDS).
 
         # Step 4 — speak the outcome.
-        if available:
-            # Log to Linear FIRST, before the transfer kills the agent.
-            # Once AgentTransferCall fires, we have no chance to log.
+        #
+        # Important ordering: check the transfer target BEFORE logging
+        # the "transferred" Linear ticket or setting completed_flag. If
+        # CONFERENCE_JOIN_NUMBER is unset (misconfig), the probe succeeded
+        # but we have nowhere to send the caller — we must fall back to
+        # the ticket flow WITHOUT polluting Linear with a fake transfer
+        # ticket and WITHOUT blinding the abandoned-call wrapper.
+        target = os.environ.get("CONFERENCE_JOIN_NUMBER", "") if available else ""
+
+        if available and target:
+            # Real transfer: log first (the transfer kills our agent leg),
+            # mark complete (so the CallEnded wrapper doesn't double-log),
+            # announce, then transfer.
             await log_call_complete(
                 call_id=call_id,
                 caller_number=caller_number,
@@ -177,33 +199,22 @@ def make_escalate_tool(call_request: CallRequest, completed_flag=None):
                 text="Looks like someone's available — connecting you now.",
                 interruptible=False,
             )
-            target = os.environ.get("CONFERENCE_JOIN_NUMBER", "")
-            if target:
-                yield AgentTransferCall(target_phone_number=target)
-            else:
+            yield AgentTransferCall(target_phone_number=target)
+        else:
+            # Two cases land here:
+            #   (a) Probe failed (no one picked up within timeout)
+            #   (b) Probe succeeded but CONFERENCE_JOIN_NUMBER is unset
+            # Both fall through to the callback/email flow with the same
+            # spoken message. The LLM's record_followup + end_call_with_goodbye
+            # will produce the correct final Linear ticket — don't log
+            # anything here.
+            if available and not target:
                 logger.error(
                     "Probe succeeded but CONFERENCE_JOIN_NUMBER unset — "
                     "can't transfer. Falling through to ticket flow."
                 )
-                yield AgentSendText(
-                    text=(
-                        "Actually, looks like our team's tied up after all. "
-                        "I can take your name and a callback number to have "
-                        "someone follow up within one business day, or you "
-                        "can email support at basic capital dot com if "
-                        "that's easier — which works better for you?"
-                    ),
-                    interruptible=False,
-                )
-        else:
             yield AgentSendText(
-                text=(
-                    "Looks like our team is tied up right now. I can take "
-                    "your name and a callback number to have someone follow "
-                    "up within one business day, or you can email support "
-                    "at basic capital dot com if that's easier — which "
-                    "works better for you?"
-                ),
+                text=TEAM_UNAVAILABLE_MESSAGE,
                 interruptible=False,
             )
 
@@ -283,14 +294,19 @@ def _place_probe_call(client, to_number: str, from_number: str, twiml: str) -> O
 
 
 async def _wait_for_participant(client, conf_name: str, timeout_s: int) -> bool:
-    deadline = asyncio.get_event_loop().time() + timeout_s
-    while asyncio.get_event_loop().time() < deadline:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
         try:
             participants = await asyncio.to_thread(_list_participants, client, conf_name)
             if participants:
                 return True
         except Exception as e:
-            logger.debug("Participant poll error (ignorable): %s", e)
+            # Log loudly: if Twilio auth breaks or the API regresses, every
+            # probe will silently time out and you'd never see why. INFO
+            # logger isn't enough — needs to be visible.
+            logger.warning(
+                "Twilio participant poll failed (will retry): %s", e
+            )
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
     return False
 

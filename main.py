@@ -4,19 +4,17 @@ import logging
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import AsyncIterable
+from typing import Annotated, AsyncIterable, Literal
 from zoneinfo import ZoneInfo
-
-from typing import Annotated, Literal
 
 from line.agent import TurnEnv
 from line.events import (
     AgentEndCall,
     AgentSendText,
     CallEnded,
-    CallStarted,
     InputEvent,
     OutputEvent,
+    UserTurnEnded,
 )
 from line.llm_agent import LlmAgent, LlmConfig
 from line.llm_agent.tools.decorators import passthrough_tool
@@ -107,6 +105,63 @@ def make_end_call_tool(call_request: CallRequest, completed_flag=None):
 
     return end_call_with_goodbye
 
+
+def make_end_voicemail_tool(call_request: CallRequest, completed_flag=None):
+    """Factory for the voicemail-end tool used by the closed-hours agent.
+
+    Same shape as make_end_call_tool but voicemail-specific: hardcodes
+    outcome='voicemail' and intent_summary='After-hours voicemail', since
+    the closed-hours branch never has any other use case. Fewer params
+    for the LLM to choose from = fewer ways it can pick the wrong one.
+
+    Like make_end_call_tool, sets completed_flag[0] when fired so the
+    CallEnded wrapper in get_agent knows the call wrapped cleanly.
+    """
+    call_id = call_request.call_id
+    caller_number = call_request.from_ or "unknown"
+
+    @passthrough_tool
+    async def end_voicemail(
+        ctx,
+        farewell: Annotated[
+            str,
+            "Short, warm goodbye to speak before hanging up. Examples: "
+            "'Got it — our team will get back to you on the next business "
+            "day. Take care.' / 'Thanks for the message — talk soon.'",
+        ],
+        caller_name: Annotated[
+            str,
+            "Caller's name if they mentioned it during the message. "
+            "Empty string '' if they never said it.",
+        ],
+        message_summary: Annotated[
+            str,
+            "Two or three sentences capturing the caller's voicemail in "
+            "their own words, written for the ops team to scan. Include "
+            "what they wanted, any callback number or email they "
+            "mentioned, and anything time-sensitive.",
+        ],
+    ):
+        """Wrap up an after-hours voicemail: log a Linear ticket + Slack
+        summary with outcome=voicemail and the caller's message in the
+        recap, speak the farewell, and end the call. This is the only
+        way the closed-hours agent ends a call cleanly."""
+        await log_call_complete(
+            call_id=call_id,
+            caller_number=caller_number,
+            caller_name=caller_name or None,
+            intent_summary="After-hours voicemail",
+            outcome="voicemail",
+            recap=message_summary,
+        )
+        if completed_flag is not None:
+            completed_flag[0] = True
+        yield AgentSendText(text=farewell, interruptible=False)
+        yield AgentEndCall(interruptible=False)
+
+    return end_voicemail
+
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -118,8 +173,10 @@ FAQS = (Path(__file__).parent / "faqs.md").read_text()
 
 # === System prompt =========================================================
 # Notes:
-#   - Bot identity: "Alex". Does NOT self-identify as AI (per project policy).
-#   - If asked "are you a robot/AI/human?", escalate rather than answer.
+#   - Bot identity: "Alex". Greeting does NOT proactively disclose AI, but
+#     if the caller asks, Alex confirms as "AI customer support specialist"
+#     and offers continue-or-transfer (see the "Bot identity" section in
+#     the prompt below — policy updated 2026-05-01).
 #   - Account-specific data → escalate. General how-to (even with "my") → answer.
 #   - Compliance-verbatim phrases live at the bottom of faqs.md.
 SYSTEM_PROMPT = f"""You are Alex, the phone assistant for Basic Capital. \
@@ -431,11 +488,12 @@ Examples by outcome:
 they're good):
   farewell="Thanks for calling Basic Capital — have a great one!"
   caller_name="" (you may not have asked their name for a quick FAQ)
-  intent_summary="wanted to know the 401(k) contribution limit"
+  intent_summary="wanted to know the 401k contribution limit"
   outcome="answered_from_faq"
-  recap="Caller asked about 401(k) annual contribution limits. I gave \
-the 2025 figures: $23,500 standard plus $7,500 catch-up at 50+. They \
-were satisfied."
+  recap="Caller asked about 401k annual contribution limits. I gave \
+the 2026 IRS figure of $24,500. Flagged that the IRS catch-up brings \
+the limit to $32,500 at age 50+ but BC doesn't process catch-up \
+contributions today. They were satisfied."
 
 **callback_logged** (record_followup was called with phone earlier):
   farewell="Got it, Aryamaan — someone will be in touch. Have a great day."
@@ -493,39 +551,175 @@ def _is_within_business_hours(now: datetime) -> bool:
     return start_hour <= local.hour < end_hour
 
 
-CLOSED_HOURS_MESSAGE = (
-    "Thanks for calling Basic Capital. Our team is available Monday "
-    "through Friday, nine in the morning to seven in the evening Eastern "
-    "time. Please call back during those hours, or email support at basic "
-    "capital dot com. Have a good one."
+VOICEMAIL_GREETING = (
+    "Thanks for calling Basic Capital. We're closed right now — back "
+    "Monday through Friday, nine in the morning to seven in the evening "
+    "Eastern time. Heads-up that the call's recorded. Leave a quick "
+    "message and our team will get back to you on the next business "
+    "day. Or email support at basic capital dot com if that's easier. "
+    "Go ahead — I'm listening."
 )
 
 
+VOICEMAIL_SYSTEM_PROMPT = """You are Alex, the after-hours voicemail \
+assistant for Basic Capital.
+
+The caller is calling outside business hours. They just heard a greeting \
+inviting them to leave a message. Your ONLY job: capture one message, \
+then call `end_voicemail`. You are NOT having a conversation.
+
+# The flow — strict
+Exactly two things happen:
+1. The caller speaks their message (one turn).
+2. You call `end_voicemail` immediately after they finish.
+
+That's it. No follow-up questions. No "anything else?". No acknowledgement \
+mid-message ("got it" / "mm-hmm" / "okay"). The greeting was the last \
+audio the caller hears from you before the farewell inside `end_voicemail`.
+
+# Calling end_voicemail
+The moment the caller finishes their message, call:
+
+    end_voicemail(
+        farewell="<short warm goodbye, e.g. 'Got it — our team will get \
+back to you on the next business day. Take care.'>",
+        caller_name="<their name if they mentioned it during the message, \
+else ''>",
+        message_summary="<2-3 sentences capturing what they said in their \
+own words, written for ops to scan. Include callback number/email if they \
+gave one, and anything time-sensitive.>"
+    )
+
+Atomic-tool rule: generate NO text in the same turn as `end_voicemail`. \
+The tool's `farewell` is the only thing the caller hears next.
+
+# What NOT to do
+- Don't ask follow-up questions ("anything else?", "what's a good number?", \
+"can you give me more detail?"). The team will follow up — your job is \
+to capture, not interview.
+- Don't acknowledge mid-message ("got it", "mm-hmm", "okay"). Stay silent \
+while they speak.
+- Don't try to answer Basic Capital questions. We're closed.
+- Don't try to escalate or transfer. No one's around. Just capture.
+- Don't recap the message back to the caller out loud. Capture it in \
+`message_summary` and end the call.
+
+# Edge cases (still one-shot)
+- They say "transfer me to a human" → their request IS the message. \
+Capture it in `message_summary` and call `end_voicemail`. Don't argue \
+about availability.
+- They ask a question → that IS the message. Capture it as their ask in \
+`message_summary` and call `end_voicemail`. Don't try to answer.
+- They ramble across multiple thoughts in one turn → that's still one \
+message. Capture all of it in `message_summary` when they pause.
+
+# Pronunciation (same as main agent)
+Spoken (farewell): phonetic forms — "four-oh-one K", "I R A", \
+"fifty-nine and a half". Written (`message_summary`): digit/abbreviation \
+forms — "401k", "IRA", "59½".
+"""
+
+
 def make_closed_hours_agent(call_request: CallRequest):
-    """Factory for the no-LLM closed-hours agent. Logs to Linear before
-    speaking the closed-hours message and hanging up so out-of-hours calls
-    still show up in the ops tracker."""
+    """LLM-driven voicemail agent for out-of-hours calls.
+
+    Replaces the previous fire-and-hangup behavior. Greets the caller,
+    invites a message, listens, and when they're done the LLM calls
+    `end_voicemail` to log a Linear ticket with outcome='voicemail' and
+    the caller's message in the recap.
+
+    Cartesia records the bot↔caller audio as usual, so the voicemail
+    audio is available via the Cartesia deep-link in the Linear ticket
+    (no separate Twilio recording needed for this path).
+
+    Like the main agent, this is wrapped in a CallEnded handler so that
+    a caller who hangs up before leaving a message still produces an
+    'abandoned' Linear ticket.
+    """
+    completed = [False]
+    # Counts UserTurnEnded events. The voicemail flow should be exactly
+    # one user turn (the message) followed by end_voicemail. If the LLM
+    # asks a follow-up and the caller speaks a SECOND time, we force-end
+    # — see the wrapper below.
+    user_turns = [0]
+
+    llm_agent = LlmAgent(
+        model="anthropic/claude-haiku-4-5",
+        api_key=os.environ.get("ANTHROPIC_API_KEY"),
+        tools=[make_end_voicemail_tool(call_request, completed_flag=completed)],
+        config=LlmConfig(
+            system_prompt=VOICEMAIL_SYSTEM_PROMPT,
+            introduction=VOICEMAIL_GREETING,
+        ),
+    )
+
     call_id = call_request.call_id
     caller_number = call_request.from_ or "unknown"
 
-    async def _closed_hours_agent(env: TurnEnv, event: InputEvent) -> AsyncIterable[OutputEvent]:
-        if isinstance(event, CallStarted):
+    async def voicemail_agent_with_abandoned_logging(
+        turn_env: TurnEnv, event: InputEvent
+    ) -> AsyncIterable[OutputEvent]:
+        if isinstance(event, CallEnded) and not completed[0]:
+            logger.info(
+                "Closed-hours call %s ended without voicemail — logging abandoned",
+                call_id,
+            )
             await log_call_complete(
                 call_id=call_id,
                 caller_number=caller_number,
                 caller_name=None,
-                intent_summary="Called outside business hours",
-                outcome="closed_hours",
+                intent_summary="Closed-hours hangup before voicemail",
+                outcome="abandoned",
                 recap=(
-                    "Caller hit the closed-hours message and was redirected "
-                    "to call back during business hours or email support. "
-                    "No live conversation took place."
+                    "Caller dialed in after hours and hung up before leaving "
+                    "a message. Cartesia transcript captures whatever was "
+                    "said (if anything) before they disconnected."
                 ),
             )
-            yield AgentSendText(text=CLOSED_HOURS_MESSAGE, interruptible=False)
-            yield AgentEndCall(interruptible=False)
+            completed[0] = True
+            return
 
-    return _closed_hours_agent
+        # Hard cap: voicemail is one message, not a chat. If the caller
+        # has already spoken once and is speaking again, the LLM drifted
+        # past the strict "one turn → end_voicemail" rule. Force-end here
+        # so chatty/anxious callers don't get stuck in a loop with Alex.
+        if isinstance(event, UserTurnEnded):
+            user_turns[0] += 1
+            if user_turns[0] >= 2 and not completed[0]:
+                logger.warning(
+                    "Voicemail %s: %d user turns without LLM wrapping — "
+                    "forcing end_voicemail",
+                    call_id,
+                    user_turns[0],
+                )
+                await log_call_complete(
+                    call_id=call_id,
+                    caller_number=caller_number,
+                    caller_name=None,
+                    intent_summary="After-hours voicemail (turn cap forced)",
+                    outcome="voicemail",
+                    recap=(
+                        "Voicemail wrap forced after the caller spoke "
+                        "multiple times — the LLM didn't call end_voicemail "
+                        "cleanly. Listen to the Cartesia audio for the "
+                        "actual message content."
+                    ),
+                )
+                completed[0] = True
+                yield AgentSendText(
+                    text=(
+                        "Got it — passing this along. Our team will get "
+                        "back to you on the next business day. Take care."
+                    ),
+                    interruptible=False,
+                )
+                yield AgentEndCall(interruptible=False)
+                return
+
+        async for output in llm_agent.process(turn_env, event):
+            yield output
+
+    return voicemail_agent_with_abandoned_logging
 
 
 # === Agent factory =========================================================

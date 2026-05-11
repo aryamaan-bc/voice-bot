@@ -10,4 +10,4 @@ dependencies = [
 ]
 
 [tool.setuptools]
-py-modules = ["main", "escalation", "slack_ticket"]
+py-modules = ["main", "escalation", "slack_ticket", "linear_ticket"]
