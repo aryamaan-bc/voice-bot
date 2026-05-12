@@ -12,8 +12,9 @@
 # - Compliance-load-bearing phrasings live below in the "Legal phrasings" block
 #   and should NOT be paraphrased.
 # - Any edit here requires a redeploy (the file is loaded once per container).
-# - Contribution limits below are 2025 numbers from the playbook. Update to
-#   2026 limits when confirmed with accounting before going live.
+# - Contribution limits below are 2026 numbers ($24,500 401k / $7,500 IRA,
+#   plus catch-up figures — flagged as not-yet-supported by BC). Update when
+#   the 2027 numbers are confirmed.
 
 # ============================================================================
 # 1. Account basics & company info

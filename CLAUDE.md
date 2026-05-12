@@ -19,8 +19,9 @@ behavior, gotchas, and rules that aren't obvious from the code.
      every 10s to mask probe silence) → outcome speech entirely inside the
      tool. The LLM calls it and goes silent.
   2. `record_followup` ([slack_ticket.py](slack_ticket.py)) — `loopback_tool`
-     for the unavailable path. Logs callback or email request to Slack;
-     returns the exact verbatim string for the LLM to speak back.
+     for the unavailable path. Logs the callback request (default) or
+     email follow-up (if the caller proactively asks) to Slack; returns
+     the exact verbatim string for the LLM to speak back.
   3. `end_call_with_goodbye` ([main.py](main.py)) — `passthrough_tool`. Logs
      to Linear + Slack, then speaks the farewell, then hangs up. Every clean
      call wrap-up goes through this.

@@ -30,8 +30,9 @@ def make_end_call_tool(call_request: CallRequest, completed_flag=None):
 
     Why this is a factory (and why we don't use line.llm_agent.end_call):
       - The built-in end_call only yields AgentEndCall and relies on the
-        LLM to speak a goodbye first. Gemini Flash often skips the
-        goodbye, hanging up silently. We wrap it.
+        LLM to speak a goodbye first. LLMs (Haiku and others) sometimes
+        skip the goodbye, hanging up silently. We wrap it so the
+        farewell is guaranteed.
       - Closing over call_request lets the tool log to Linear with the
         correct call_id and caller_number — Line's tool ctx is empty.
 
@@ -468,9 +469,9 @@ time):
 with?"
 - "All good there — any other questions, or anything else?"
 
-After record_followup logs a callback or email, the tool's return \
-string already includes the close — speak it verbatim, don't add \
-another one on top.
+After record_followup logs the follow-up (callback or email), the \
+tool's return string already includes the close — speak it verbatim, \
+don't add another one on top.
 
 After the caller responds:
   - "Yes, one more thing" / "Actually, also…" → keep helping; loop back \

@@ -6,15 +6,16 @@ The tool handles the entire escalation flow itself:
   3. Runs the probe (real Twilio in production; 5s sleep in demo mode).
   4. Speaks the outcome:
        - Available: "Connecting you now" + AgentTransferCall.
-       - Unavailable: "Team is tied up — would you like a callback or to
-         email us?" Then the LLM handles the next steps (gathering name/
-         number, calling record_followup).
+       - Unavailable: "Sorry, all our lines are busy — what's your full
+         name?" Then the LLM handles callback intake (name + phone,
+         calling record_followup). Email path still works if the caller
+         proactively asks, but the bot doesn't offer it.
 
 Why passthrough instead of loopback:
-  Gemini 2.5 Flash unreliably interleaves text generation with tool calls,
-  and unreliably calls multiple tools in sequence. Putting all the speech
-  INSIDE the tool — yielding AgentSendText events directly — sidesteps the
-  model's tool-calling quirks entirely.
+  LLMs (Haiku and friends) unreliably interleave text generation with
+  tool calls, and don't always chain multiple tool calls cleanly.
+  Putting all the speech INSIDE the tool — yielding AgentSendText events
+  directly — sidesteps that whole class of bug.
 """
 
 import asyncio
@@ -22,6 +23,7 @@ import logging
 import os
 import time
 from typing import Annotated, Optional
+from urllib.parse import quote
 
 import httpx
 from line.events import AgentSendText, AgentTransferCall
@@ -44,11 +46,15 @@ POLL_INTERVAL_SECONDS = 1
 # filler addresses "are you still there?" head-on so callers don't have
 # to ask.
 PROBE_FILLER_INTERVAL_SECONDS = 10
+# Wording deliberately avoids "one moment" / "one second" — those phrases
+# are already in the escalation announcements (e.g., "Sure — one moment,
+# connecting you to our team."), so echoing them in the first filler
+# 10 seconds later sounded repetitive.
 PROBE_FILLERS = [
-    "Yep, still here — just reaching out to our team. One moment.",
-    "Bear with me — should just be another second.",
-    "Hang tight, almost there.",
-    "Really appreciate your patience — almost set.",
+    "Yep, still here — reaching out to our team now.",
+    "Bear with me — almost there.",
+    "Hang tight, getting someone on the line.",
+    "Really appreciate your patience — won't be long.",
 ]
 
 # Spoken on both the probe-failed path AND the misconfigured-target path
@@ -130,11 +136,13 @@ def make_escalate_tool(call_request: CallRequest, completed_flag=None):
 
         After this tool finishes, the caller has been told either:
           - The call is being transferred (and AgentTransferCall has fired)
-          - The team is tied up — would they prefer callback or email?
+          - Our lines are busy + "what's your full name?" — leading the
+            caller into the callback intake flow
 
-        For the unavailable path, your next job is to wait for the
-        caller's response, ask for their name (and phone number if they
-        chose callback), then call record_followup.
+        For the unavailable path, your next job is to collect the
+        caller's name and a callback number, then call record_followup.
+        The unavailable speech already asked for the name, so don't
+        re-ask — just take the response and proceed to the number.
         """
         logger.info(
             "escalate_to_human START call_id=%s intent=%r", call_id, intent_summary
@@ -299,14 +307,44 @@ async def _real_probe(call_id: str, caller_number: str) -> bool:
 
 
 def _build_probe_twiml(conf_name: str) -> str:
-    # No Polly preamble: it ate ~5s of join time, which pushed past
-    # PROBE_TIMEOUT_SECONDS in testing. Slack already pings the responder
-    # with full intent context before they pick up.
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
+    """TwiML played on the responder's leg when the probe places an
+    outbound call to their cell.
+
+    With TWILIO_FUNCTIONS_DOMAIN set: plays "Press 1 to accept" and
+    routes <Gather> at the /probe-accept Function. Voicemails can't
+    press digits, so this gate filters them out cleanly — only a live
+    responder who confirms by pressing 1 actually joins the conference.
+
+    Without the env var (or before /probe-accept is deployed): falls
+    back to direct conference join (no press-1 gate). Loses voicemail
+    filtering but keeps the normal flow working. Safe to roll back.
+
+    Slack already pings the responder with intent context before they
+    pick up, so the responder knows what the call is about even with
+    the press-1 prompt being terse.
+    """
+    functions_domain = os.environ.get("TWILIO_FUNCTIONS_DOMAIN", "").strip()
+    if not functions_domain:
+        logger.warning(
+            "TWILIO_FUNCTIONS_DOMAIN unset — probe will drop responders "
+            "directly into the conference (no press-1 voicemail filter)"
+        )
+        return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Dial>
     <Conference startConferenceOnEnter="true" endConferenceOnExit="true" beep="false">{conf_name}</Conference>
   </Dial>
+</Response>"""
+
+    accept_url = (
+        f"https://{functions_domain}/probe-accept?conf={quote(conf_name)}"
+    )
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Gather numDigits="1" timeout="10" action="{accept_url}" method="POST">
+    <Say voice="Polly.Joanna">You have an incoming Basic Capital call. Press 1 to accept.</Say>
+  </Gather>
+  <Hangup/>
 </Response>"""
 
 
@@ -365,7 +403,7 @@ async def _send_slack_ping(
             f":telephone_receiver: *Bot escalated (DEMO mode)*\n"
             f"*Caller:* {caller_number}\n"
             f"*Wants:* {intent_summary}\n"
-            f"_No real probe — caller will be offered callback or email._"
+            f"_No real probe — caller will be led into callback intake._"
         )
     else:
         body = (

@@ -1,10 +1,10 @@
 # Basic Capital FAQ Voice Agent
 
 Phone bot that answers general Basic Capital questions, transfers callers to a
-human when one's available, falls back to a callback or email follow-up when
-the team is tied up, and captures voicemails outside business hours. Every
-call ends with a Linear ticket + Slack DM so ops has a written record —
-including for callers who hang up mid-call and for after-hours voicemails.
+human when one's available, falls back to a callback intake when the team is
+tied up, and captures voicemails outside business hours. Every call ends with
+a Linear ticket + Slack DM so ops has a written record — including for callers
+who hang up mid-call and for after-hours voicemails.
 
 ## Stack
 
@@ -113,7 +113,7 @@ cartesia logs --follow
 2. **FAQ match** — answers from `faqs.md` in 1–2 sentences, then asks if the caller needs anything else.
 3. **Escalation** (account-specific / advice / "I want a human" / off-FAQ) — `escalate_to_human` announces, Slack-pings the team, probes the hunt group while playing periodic filler audio every 10s so the caller doesn't sit in silence:
    - **Available** → log Linear ticket (`outcome=transferred`) + `AgentTransferCall` → conference-join Twilio Function records the post-handoff conversation, posts a Slack DM with the recording link when done.
-   - **Unavailable** → Alex offers callback or email; `record_followup` logs to Slack; `end_call_with_goodbye` wraps with `outcome=callback_logged` / `email_logged`.
+   - **Unavailable** → Alex leads the caller straight into callback intake (name + phone), `record_followup` logs to Slack, `end_call_with_goodbye` wraps with `outcome=callback_logged`. If the caller proactively asks to email instead, that path is still available (`outcome=email_logged`), but the bot doesn't offer it.
 4. **Off-topic** — one polite redirect; second off-topic question → `end_call_with_goodbye(outcome=other)`.
 5. **Caller hangs up mid-call** — `CallEnded` wrapper logs `outcome=abandoned` so it still shows up in Linear/Slack.
 6. **Asked "are you a bot?"** — Alex confirms truthfully ("AI customer support specialist for Basic Capital") and offers to keep helping or transfer. Only escalates if the caller actually picks the human path.
@@ -135,7 +135,7 @@ Call your main BC Twilio number and verify:
 - [ ] **Account-specific** ("what's my balance?") → escalates without trying to answer
 - [ ] **Advice question** ("should I do a Roth conversion?") → escalates with compliance language
 - [ ] **Hunt group answers** → caller bridged; Linear ticket (`outcome=transferred`) lands; ~30s after hangup, Slack `🎞 Conference recording ready` DM lands with caller number + duration + listen link
-- [ ] **Hunt group times out** → bot speaks filler audio every ~10s during the wait; callback or email path; Slack follow-up + Linear ticket land
+- [ ] **Hunt group times out** → bot speaks filler audio every ~10s during the wait; bot leads into callback intake ("what's your full name?"); Slack follow-up + Linear ticket (`outcome=callback_logged`) land
 - [ ] **Caller hangs up mid-call** → Linear ticket with `outcome=abandoned`
 - [ ] **Off-topic** ("what's the weather?") → polite redirect; second off-topic question ends the call cleanly
 - [ ] **"Are you a bot?"** → Alex confirms truthfully (AI customer support specialist), offers to keep helping or transfer

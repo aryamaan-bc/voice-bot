@@ -8,8 +8,9 @@ Twilio Console, redeploy.
 
 | File | Path | Purpose |
 |------|------|---------|
-| `conference-join.js` | `/conference-join` | TwiML returned when 917-979-6392 receives an inbound call (i.e., when the bot transfers a customer in). Drops the caller into `bc-active`, enables recording, sets up the recording-ready callback. |
-| `recording-callback.js` | `/recording-callback` | Twilio POSTs here when a conference recording finishes processing. Posts a Slack DM with the listen URL and duration. |
+| `conference-join.js` | `/conference-join` | TwiML returned when the conference-join Twilio number receives an inbound call (i.e., when the bot transfers a customer in). Drops the caller into the per-call conference room, enables recording, sets up the recording-ready callback. |
+| `recording-callback.js` | `/recording-callback` | Twilio POSTs here when a conference recording finishes processing. Posts a Slack DM with the listen URL, caller number, and duration. |
+| `probe-accept.js` | `/probe-accept` | Gather-action handler for the responder press-1 gate. When the probe rings a responder's cell, they hear "Press 1 to accept" — if they press 1, this Function joins them into the conference. If voicemail picks up (can't press digits) or they press anything else, it hangs up cleanly. Prevents the voicemail-false-positive bug. |
 
 ## Service
 
@@ -48,6 +49,23 @@ method: POST.
 
 The `/recording-callback` URL is wired up programmatically from inside
 `conference-join.js` — no manual config needed there.
+
+## Project env var
+
+The Python code in `escalation.py` needs to know your Function
+Service's domain so it can build the `/probe-accept` URL embedded in
+probe outbound TwiML. After deploying the Functions:
+
+1. Open the Service in Twilio Console.
+2. Copy the domain (looks like `bc-voice-functions-1234.twil.io` — no
+   protocol, no path).
+3. Set `TWILIO_FUNCTIONS_DOMAIN=bc-voice-functions-1234.twil.io` in
+   your project `.env`.
+4. Push to the deployed Cartesia agent:
+   `cartesia env set --from=.env --agent-id=<your-agent-id>`.
+
+If the env var is unset, the probe falls back to direct conference
+join (no press-1 gate). Safe to roll back this way if anything breaks.
 
 ## Why Functions and not TwiML Bins
 
