@@ -22,6 +22,15 @@ exports.handler = function (context, event, callback) {
   // through the recording callback so the post-call Slack DM can show
   // who was on the call without ops having to dig in Twilio Console.
   const customerNumber = event.From || '';
+
+  // Conference name is derived from the caller's phone number so two
+  // simultaneous callers from different numbers don't share a room.
+  // Must stay in lockstep with escalation.py's `_derive_conf_name` —
+  // same input, same output, no shared state. Fallback "bc-active" is
+  // for the rare case where event.From is blank/anonymized.
+  const digits = customerNumber.replace(/\D/g, '');
+  const confName = digits ? `bc-${digits}` : 'bc-active';
+
   const callbackUrl =
     `https://${context.DOMAIN_NAME}/recording-callback` +
     `?customer=${encodeURIComponent(customerNumber)}`;
@@ -37,7 +46,7 @@ exports.handler = function (context, event, callback) {
       startConferenceOnEnter: true,
       endConferenceOnExit: true,
     },
-    'bc-active'
+    confName
   );
   callback(null, twiml);
 };

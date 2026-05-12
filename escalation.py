@@ -53,13 +53,13 @@ PROBE_FILLERS = [
 
 # Spoken on both the probe-failed path AND the misconfigured-target path
 # (probe succeeded but CONFERENCE_JOIN_NUMBER is empty — no destination
-# to transfer to). The LLM then handles the callback/email choice.
+# to transfer to). The bot leads the caller straight into callback
+# intake (name + number → record_followup). No voicemail/email branches
+# — simpler flow, single happy path.
 TEAM_UNAVAILABLE_MESSAGE = (
-    "Looks like our team is tied up right now. I can take "
-    "your name and a callback number to have someone follow "
-    "up within one business day, or you can email support "
-    "at basic capital dot com if that's easier — which "
-    "works better for you?"
+    "Sorry, all our lines are busy right now. Let me grab your "
+    "name and a callback number so someone can follow up on the "
+    "next business day — what's your full name?"
 )
 
 
@@ -68,6 +68,26 @@ def _env(name: str, *, required: bool = True) -> str:
     if required and not val:
         raise RuntimeError(f"Missing required env var: {name}")
     return val
+
+
+def _derive_conf_name(caller_number: str) -> str:
+    """Per-call Twilio conference name derived from the caller's phone
+    number.
+
+    Why: a hardcoded conference name (e.g. 'bc-active') causes two
+    simultaneous callers to land in the SAME room and overhear each
+    other — privacy bug. Deriving from the caller's number gives each
+    call its own room. Both the Python probe code and the Twilio
+    Function compute the same name from the same caller number, so they
+    coordinate without any shared state.
+
+    Edge case: the same caller dialing twice within the probe window
+    will still collide. Rare enough to accept for v1; the real fix
+    needs cross-process state (Twilio Sync) and isn't worth the
+    complexity yet.
+    """
+    digits = "".join(c for c in caller_number if c.isdigit())
+    return f"bc-{digits}" if digits else "bc-active"
 
 
 def make_escalate_tool(call_request: CallRequest, completed_flag=None):
@@ -148,7 +168,7 @@ def make_escalate_tool(call_request: CallRequest, completed_flag=None):
             await asyncio.sleep(5)
             available = False
         else:
-            probe_task = asyncio.create_task(_real_probe(call_id))
+            probe_task = asyncio.create_task(_real_probe(call_id, caller_number))
             filler_idx = 0
             while True:
                 try:
@@ -224,13 +244,19 @@ def make_escalate_tool(call_request: CallRequest, completed_flag=None):
 # === Real-mode probe (Twilio conference) ====================================
 
 
-async def _real_probe(call_id: str) -> bool:
+async def _real_probe(call_id: str, caller_number: str) -> bool:
     """Place outbound probe calls and poll the conference for participants.
-    Returns True if a human joined the conference, False otherwise."""
+    Returns True if a human joined the conference, False otherwise.
+
+    Conference name is derived from the caller's number so simultaneous
+    calls from different numbers don't share a room — see
+    `_derive_conf_name` for details. The Twilio Function on the
+    customer's transfer-in leg derives the same name from event.From.
+    """
     twilio_sid = _env("TWILIO_ACCOUNT_SID")
     twilio_token = _env("TWILIO_AUTH_TOKEN")
     from_number = _env("TWILIO_FROM_NUMBER")
-    conf_name = os.environ.get("CONFERENCE_NAME", "bc-active")
+    conf_name = _derive_conf_name(caller_number)
 
     cells = [
         c
