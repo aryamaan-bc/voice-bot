@@ -14,18 +14,31 @@ from line.events import (
     CallEnded,
     InputEvent,
     OutputEvent,
+    UserTextSent,
     UserTurnEnded,
 )
 from line.llm_agent import LlmAgent, LlmConfig
 from line.llm_agent.tools.decorators import passthrough_tool
 from line.voice_agent_app import AgentEnv, CallRequest, VoiceAgentApp
 
-from escalation import make_escalate_tool
+from escalation import make_escalate_tool, run_escalation_flow, user_wants_human
 from linear_ticket import log_call_complete
 from slack_ticket import make_followup_tool
 
 
-def make_end_call_tool(call_request: CallRequest, completed_flag=None):
+# Recovery farewell used when end_call_with_goodbye fires while an
+# escalation is in progress (Case 8 — LLM hijacked the escalation tool
+# and decided to end the call before the human arrived). Replaces the
+# LLM's chosen farewell so the caller hears something coherent.
+ESCALATION_RECOVERY_FAREWELL = (
+    "Sorry about that — our team has the request and someone will "
+    "follow up with you shortly. Take care."
+)
+
+
+def make_end_call_tool(
+    call_request: CallRequest, completed_flag=None, escalation_status=None
+):
     """Factory for the end-call-with-goodbye tool, bound to this call.
 
     Why this is a factory (and why we don't use line.llm_agent.end_call):
@@ -40,6 +53,13 @@ def make_end_call_tool(call_request: CallRequest, completed_flag=None):
     closure cell), the tool sets completed_flag[0] = True when it fires.
     The CallEnded wrapper in get_agent uses this to detect calls that
     ended cleanly vs callers who hung up mid-call.
+
+    `escalation_status` (dict with "in_progress") is checked at entry —
+    if an escalation is currently running and the LLM still chose to end
+    the call (Case 8: hijack-and-give-up), the tool replaces the LLM's
+    farewell with ESCALATION_RECOVERY_FAREWELL so the caller hears a
+    coherent message about the team following up rather than the LLM's
+    confused goodbye.
     """
     call_id = call_request.call_id
     caller_number = call_request.from_ or "unknown"
@@ -89,6 +109,28 @@ def make_end_call_tool(call_request: CallRequest, completed_flag=None):
         """Wrap up the call: log a Linear ticket + Slack summary for the
         ops team, speak the farewell, and end the call. Use this for ALL
         call wrap-ups — it's the only way to end a call cleanly."""
+        # Case 8 — LLM hijack during escalation chose end_call_with_goodbye.
+        # Override the farewell with a recovery message so the caller
+        # gets a coherent close, and force-mark outcome=other so the
+        # logged ticket doesn't claim the call was answered cleanly.
+        if escalation_status is not None and escalation_status.get("in_progress"):
+            logger.warning(
+                "end_call_with_goodbye called during active escalation "
+                "(call_id=%s) — using recovery farewell so the caller "
+                "doesn't hear a confused goodbye while team follow-up "
+                "is pending",
+                call_id,
+            )
+            farewell = ESCALATION_RECOVERY_FAREWELL
+            outcome = "other"
+            recap = (
+                "Escalation was in progress when end_call_with_goodbye "
+                "fired (LLM hijack mid-tool). The caller heard the "
+                "recovery farewell; the escalation_pending ticket from "
+                "earlier in the call is the source of truth for the "
+                "team follow-up. Original LLM-supplied recap: " + recap
+            )
+
         # Log first (fast — Slack <300ms, Linear <500ms typically) so the
         # ticket is created even if the speech/hangup somehow fails.
         await log_call_complete(
@@ -753,13 +795,32 @@ async def get_agent(env: AgentEnv, call_request: CallRequest):
     # up mid-call — log an "abandoned" ticket so it doesn't disappear.
     completed = [False]
 
+    # Shared escalation state. set True when the escalation flow enters,
+    # cleared back to False when it exits. Used by:
+    #   - escalate_to_human: skip duplicate runs (concurrent triggers).
+    #   - end_call_with_goodbye: Case 8 recovery — detect that the LLM
+    #     hijacked the tool and chose to end the call mid-escalation.
+    #   - agent_with_abandoned_logging below: Case 9 — pattern-detect
+    #     when the caller asked for a human and the LLM hasn't (yet)
+    #     called escalate_to_human, then run the escalation flow
+    #     ourselves so the caller's request never goes unanswered.
+    escalation_status = {"in_progress": False}
+
     llm_agent = LlmAgent(
         model="anthropic/claude-haiku-4-5",
         api_key=os.environ.get("ANTHROPIC_API_KEY"),
         tools=[
-            make_escalate_tool(call_request, completed_flag=completed),
+            make_escalate_tool(
+                call_request,
+                completed_flag=completed,
+                escalation_status=escalation_status,
+            ),
             make_followup_tool(call_request),
-            make_end_call_tool(call_request, completed_flag=completed),
+            make_end_call_tool(
+                call_request,
+                completed_flag=completed,
+                escalation_status=escalation_status,
+            ),
         ],
         config=LlmConfig(
             system_prompt=SYSTEM_PROMPT,
@@ -769,6 +830,14 @@ async def get_agent(env: AgentEnv, call_request: CallRequest):
 
     call_id = call_request.call_id
     caller_number = call_request.from_ or "unknown"
+
+    def _extract_user_text(ev: UserTurnEnded) -> str:
+        """Stitch a UserTurnEnded into a single transcript string. DTMF
+        and other non-text content is ignored — we only care about the
+        spoken words for the human-request pattern match."""
+        return " ".join(
+            c.content for c in ev.content if isinstance(c, UserTextSent)
+        ).strip()
 
     async def agent_with_abandoned_logging(
         turn_env: TurnEnv, event: InputEvent
@@ -789,6 +858,41 @@ async def get_agent(env: AgentEnv, call_request: CallRequest):
             )
             completed[0] = True
             return
+
+        # Case 9 — code-level guarantee that an explicit human request
+        # always triggers the escalation flow. The LLM should call
+        # escalate_to_human in response, but Haiku has been observed to
+        # answer the FAQ instead under prompt drift. Pattern-matching
+        # here is the backstop: if the caller's transcript matches a
+        # clear human-request pattern AND no escalation is already in
+        # flight, bypass the LLM for this turn and run the escalation
+        # flow directly. The flow sets escalation_status["in_progress"]
+        # so the LLM's own escalate_to_human call (if it eventually
+        # fires) becomes a safe no-op.
+        if isinstance(event, UserTurnEnded) and not escalation_status["in_progress"]:
+            user_text = _extract_user_text(event)
+            if user_text and user_wants_human(user_text):
+                logger.info(
+                    "Case 9 bypass triggered (call=%s) on user text: %r",
+                    call_id,
+                    user_text,
+                )
+                async for ev_out in run_escalation_flow(
+                    call_id=call_id,
+                    caller_number=caller_number,
+                    spoken_announcement=(
+                        "Sure — one moment, connecting you to our team."
+                    ),
+                    intent_summary=(
+                        f"Caller explicitly asked for a human "
+                        f"(pattern-detected from: {user_text[:140]!r})"
+                    ),
+                    completed_flag=completed,
+                    escalation_status=escalation_status,
+                ):
+                    yield ev_out
+                return
+
         async for output in llm_agent.process(turn_env, event):
             yield output
 

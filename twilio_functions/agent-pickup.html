@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Basic Capital — Take Call</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+           max-width: 480px; margin: 40px auto; padding: 0 20px; line-height: 1.5; }
+    h1 { font-size: 20px; margin-bottom: 4px; }
+    .caller { background: #fef3c7; border: 1px solid #fcd34d; border-radius: 8px;
+              padding: 12px 16px; margin: 12px 0; font-size: 15px; }
+    .caller > div + div { margin-top: 4px; }
+    .meta { color: #666; font-size: 14px; margin-bottom: 24px; }
+    .fallback { margin-top: 16px; padding: 12px; background: #fee2e2;
+                border-radius: 8px; font-size: 13px; color: #991b1b; }
+    .fallback.urgent { padding: 16px; font-size: 15px; font-weight: 600;
+                       border: 2px solid #dc2626; }
+    .fallback.urgent::before { content: "⚠ "; }
+    @media (prefers-color-scheme: dark) {
+      .caller { background: #422006; border-color: #92400e; color: #fde68a; }
+      .fallback { background: #450a0a; color: #fecaca; }
+      .fallback.urgent { border-color: #ef4444; }
+    }
+    button { font-size: 16px; padding: 12px 20px; border-radius: 8px; border: 0;
+             background: #2563eb; color: white; cursor: pointer; }
+    button:hover { background: #1d4ed8; }
+    button:disabled { background: #94a3b8; cursor: not-allowed; }
+    .status { margin-top: 20px; padding: 12px; background: #f1f5f9; border-radius: 8px;
+              font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px;
+              white-space: pre-wrap; min-height: 60px; }
+    .err { color: #b91c1c; }
+    .ok  { color: #047857; }
+    @media (prefers-color-scheme: dark) {
+      .status { background: #1e293b; color: #e2e8f0; }
+      .meta { color: #94a3b8; }
+    }
+  </style>
+</head>
+<body>
+  <h1>Basic Capital — Take Call</h1>
+  <div class="caller">
+    <div><strong>Caller:</strong> <span id="customer">(unknown)</span></div>
+    <div><strong>Wants:</strong> <span id="intent">(unknown)</span></div>
+  </div>
+  <div class="meta">Conference: <code id="conf">(none)</code></div>
+  <button id="join">Join call</button>
+  <button id="hangup" disabled>Hang up</button>
+  <div class="status" id="log">Idle.</div>
+  <div class="fallback" id="fallback" hidden>
+    <strong>If the connection fails:</strong> call the customer directly at the number above. Then update the Linear ticket so the team has the record.
+  </div>
+
+  <script src="https://unpkg.com/@twilio/voice-sdk@2.10.0/dist/twilio.min.js"></script>
+  <script>
+    const params = new URLSearchParams(location.search);
+    const conf = (params.get('conf') || '').replace(/[^a-zA-Z0-9-]/g, '');
+    const identity = (params.get('id') || 'bc-agent').replace(/[^a-zA-Z0-9_.-]/g, '').slice(0, 32);
+    const customer = (params.get('customer') || '').slice(0, 32);
+    const intent = (params.get('intent') || '').slice(0, 200);
+    const confEl = document.getElementById('conf');
+    const customerEl = document.getElementById('customer');
+    const intentEl = document.getElementById('intent');
+    const joinBtn = document.getElementById('join');
+    const hangupBtn = document.getElementById('hangup');
+    const logEl = document.getElementById('log');
+    const fallbackEl = document.getElementById('fallback');
+
+    confEl.textContent = conf || '(missing)';
+    customerEl.textContent = customer || '(unknown — older Slack link)';
+    intentEl.textContent = intent || '(unknown)';
+    if (customer) fallbackEl.hidden = false;
+    if (!conf) {
+      joinBtn.disabled = true;
+      logEl.textContent = 'No conference name in URL. Open the link from the Slack button.';
+      logEl.classList.add('err');
+    }
+
+    let device, call, watchdog, connected = false;
+    const log = (msg, cls) => {
+      logEl.textContent = msg;
+      logEl.className = 'status' + (cls ? ' ' + cls : '');
+    };
+
+    // 10s watchdog. If we click Join but `accept` never fires (WebRTC
+    // handshake stuck — firewall, mic permission, codec mismatch), flip
+    // the fallback box to URGENT mode so the responder knows to call the
+    // customer directly. The Linear ticket from escalation_started is
+    // already in place; this just speeds up the manual fallback.
+    const startWatchdog = () => {
+      clearTimeout(watchdog);
+      watchdog = setTimeout(() => {
+        if (connected) return;
+        if (customer) {
+          fallbackEl.hidden = false;
+          fallbackEl.classList.add('urgent');
+          fallbackEl.innerHTML =
+            'Connection is stuck. Call the customer directly: <strong>' +
+            customer + '</strong>. Update the Linear ticket so the team has the record.';
+        }
+        log('Connection taking too long — see the red box below for the fallback.', 'err');
+      }, 10000);
+    };
+    const clearWatchdog = () => { clearTimeout(watchdog); watchdog = null; };
+
+    joinBtn.onclick = async () => {
+      joinBtn.disabled = true;
+      connected = false;
+      fallbackEl.classList.remove('urgent');
+      log('Requesting access token...');
+      startWatchdog();
+      try {
+        const res = await fetch(`/agent-token?identity=${encodeURIComponent(identity)}`);
+        if (!res.ok) throw new Error(`Token endpoint returned ${res.status}`);
+        const { token } = await res.json();
+
+        log('Initializing browser phone...');
+        device = new Twilio.Device(token, { codecPreferences: ['opus', 'pcmu'] });
+        device.on('error', (e) => log('Device error: ' + (e && e.message || e), 'err'));
+
+        log('Connecting to conference...');
+        call = await device.connect({ params: { conference: conf } });
+        call.on('accept', () => {
+          connected = true;
+          clearWatchdog();
+          fallbackEl.classList.remove('urgent');
+          log('Connected. You are live with the caller.', 'ok');
+          hangupBtn.disabled = false;
+        });
+        call.on('disconnect', () => {
+          connected = false;
+          clearWatchdog();
+          log('Call ended.', '');
+          hangupBtn.disabled = true;
+          joinBtn.disabled = false;
+        });
+        call.on('cancel', () => {
+          connected = false;
+          clearWatchdog();
+          log('Call canceled.', '');
+          hangupBtn.disabled = true;
+          joinBtn.disabled = false;
+        });
+        call.on('reject', () => {
+          connected = false;
+          clearWatchdog();
+          log('Call rejected.', 'err');
+          hangupBtn.disabled = true;
+          joinBtn.disabled = false;
+        });
+      } catch (e) {
+        clearWatchdog();
+        log('Failed to join: ' + (e && e.message || e), 'err');
+        joinBtn.disabled = false;
+      }
+    };
+
+    hangupBtn.onclick = () => {
+      if (call) { try { call.disconnect(); } catch (_) {} }
+      if (device) { try { device.destroy(); } catch (_) {} }
+      hangupBtn.disabled = true;
+      joinBtn.disabled = false;
+      log('Disconnected.');
+    };
+  </script>
+</body>
+</html>

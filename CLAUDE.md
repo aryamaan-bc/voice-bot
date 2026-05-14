@@ -6,37 +6,107 @@ behavior, gotchas, and rules that aren't obvious from the code.
 
 ## Architecture in one screen
 
+- **Public number**: `+1 (888) 460-4901` (toll-free). Imported into Cartesia
+  via the Twilio integration (see "Toll-free import flow" below). Cartesia
+  handles the Twilio webhook wiring — do NOT set the toll-free's voice URL
+  by hand.
 - **Entry point**: `get_agent` in [main.py](main.py) returns either:
   - **Closed-hours voicemail agent** — LLM-driven, single tool (`end_voicemail`),
     strict one-turn capture flow with a force-end safety net.
-  - **Main FAQ agent** — full `LlmAgent` with three tools, wrapped in a
-    `CallEnded` handler that catches mid-call hangups as `abandoned` tickets.
+  - **Main FAQ agent** — full `LlmAgent` with three tools, wrapped in
+    `agent_with_abandoned_logging` which handles BOTH the `CallEnded`
+    abandoned-ticket fallback AND the **Case 9 pre-LLM bypass**: if the user
+    transcript matches `user_wants_human()` and no escalation is in progress,
+    the wrapper runs the escalation flow directly without invoking the LLM.
+- **Per-call shared state** (lives in `get_agent`, passed to tool factories):
+  - `completed = [False]` — set True when any clean termination fires (used
+    by `CallEnded` to skip the duplicate abandoned ticket).
+  - `escalation_status = {"in_progress": False}` — set True the moment
+    `run_escalation_flow` enters, cleared in `finally`. Used by
+    `escalate_to_human` to skip duplicate runs and by `end_call_with_goodbye`
+    to detect Case 8 (LLM hijack ending the call mid-escalation).
 - **Three tools for the main agent**, all factory-built per call so they can
-  close over `call_request.call_id` and `call_request.from_` (Line's tool `ctx`
-  is empty):
+  close over `call_request.call_id` and `call_request.from_` (Line's tool
+  `ctx` is empty):
   1. `escalate_to_human` ([escalation.py](escalation.py)) — `passthrough_tool`.
-     Announces → Slack-pings team → Twilio probe (with periodic filler audio
-     every 10s to mask probe silence) → outcome speech entirely inside the
-     tool. The LLM calls it and goes silent.
+     Delegates to `run_escalation_flow()`, which is also called directly from
+     the main.py wrapper for the Case 9 bypass. Single source of truth for
+     the escalation behavior.
   2. `record_followup` ([slack_ticket.py](slack_ticket.py)) — `loopback_tool`
      for the unavailable path. Logs the callback request (default) or
      email follow-up (if the caller proactively asks) to Slack; returns
      the exact verbatim string for the LLM to speak back.
-  3. `end_call_with_goodbye` ([main.py](main.py)) — `passthrough_tool`. Logs
-     to Linear + Slack, then speaks the farewell, then hangs up. Every clean
-     call wrap-up goes through this.
+  3. `end_call_with_goodbye` ([main.py](main.py)) — `passthrough_tool`. Checks
+     `escalation_status["in_progress"]` at entry; if active, replaces the
+     LLM's farewell with `ESCALATION_RECOVERY_FAREWELL` (Case 8). Logs to
+     Linear + Slack, speaks farewell, hangs up.
 - **One tool for the voicemail agent**:
   - `end_voicemail` ([main.py](main.py)) — same shape as
     `end_call_with_goodbye` but with three params (`farewell`, `caller_name`,
     `message_summary`) instead of five; hardcodes `outcome="voicemail"`.
 - **Per-call ticketing**: `log_call_complete` in
-  [linear_ticket.py](linear_ticket.py) is the single entry point. Called from
-  every termination path. Outcomes: `answered_from_faq | callback_logged |
-  email_logged | transferred | closed_hours | voicemail | abandoned | other`.
+  [linear_ticket.py](linear_ticket.py) is the unified entry for outcome
+  tickets. `log_escalation_started` fires the moment an escalation begins
+  (intentionally duplicates with the final-outcome ticket — guarantees a
+  paper trail even when the rest of the call falls apart silently). Outcomes:
+  `answered_from_faq | callback_logged | email_logged | transferred |
+  closed_hours | voicemail | abandoned | escalation_pending | other`.
+- **Browser pickup (the human's side)**: when escalation fires, the Slack
+  ping has a "Take call in browser" button URL pointing at
+  `agent-pickup.html` with `?conf=<conf>&customer=<E.164>&intent=<short>`.
+  The page loads Twilio Voice JS SDK from unpkg, fetches an Access Token
+  from `/agent-token`, dials into the conference via `/agent-dial`. A 10s
+  watchdog flips a red urgent banner with the customer's phone number if
+  the WebRTC handshake stalls (Case 6 recovery).
 - **Post-handoff recording**: when a call transfers, Cartesia is out of the
   loop. Twilio records the conference (via `conference-join.js` Function),
   and `recording-callback.js` posts a Slack DM with the listen link when the
   recording is ready.
+
+## LLM-hijack recovery (Cases 1-9) — the core production-safety story
+
+Cartesia's voice agent is real-time bidirectional: the customer's mic is
+always live, feeding STT into the LLM. There is no Line-SDK API to mute
+user audio during a passthrough tool. If the customer speaks during the
+silent gap between filler-audio lines, the LLM can be invoked and
+"hijack" the in-progress escalate_to_human tool — generating a
+conversational response that derails the escalation. Three layered
+defenses, all in [escalation.py](escalation.py) + [main.py](main.py):
+
+1. **Tight filler audio** ([escalation.py](escalation.py)). `PROBE_FILLER_INTERVAL_SECONDS = 4`,
+   14 filler lines, each ~3s spoken. Net silent window between fillers is
+   ~1s — much harder for the user's speech to slip into the LLM. Was 10s
+   before; the change cut hijack frequency dramatically. Don't widen the
+   interval without adding more fillers.
+2. **Pinned probe task** (`_ACTIVE_PROBE_TASKS`). The probe runs as an
+   asyncio task. If the LLM hijacks and Cartesia cancels the generator,
+   the spawned task would normally be cancelled too. Storing it in a
+   module-level set pins it until completion — so participant detection
+   and the force-redirect still fire even after a hijack.
+3. **Force-redirect via Twilio REST API** (`_force_redirect_to_conference`).
+   When a human joins the conference, the probe task does TWO things:
+   (a) returns True so the happy-path `AgentTransferCall` yield fires;
+   (b) schedules a delayed (4s) REST API call to move the customer's call
+   into the conference. The delay lets the "I'm connecting you" speech
+   play in the happy path. If the LLM hijacked, the speech yield is
+   dropped — the REST call fires anyway and pulls the customer in.
+   `completed_flag` gates the REST call: if `AgentTransferCall` already
+   moved the call, the REST call no-ops.
+
+**Case-by-case mapping** (numbering matches the rollout discussion):
+- Case 1: Hijack + human joins → force-redirect recovers the call.
+- Case 2: Hijack + no human → `escalation_pending` Linear ticket gives team trail.
+- Case 3: Hangup mid-call → REST update fails harmlessly, ticket exists.
+- Case 4/5: Hijack triggers other tool / concurrent escalations → in_progress flag de-dupes.
+- Case 6: WebRTC hangs on human side → pickup-page watchdog flashes red banner.
+- Case 7: Conference orphan → `<Dial timeLimit="600">` safety cap.
+- Case 8: Hijack + `end_call_with_goodbye` → recovery farewell replaces LLM's chosen farewell.
+- Case 9: LLM never escalates → pre-LLM pattern matcher bypasses LLM and runs escalation.
+
+If you change anything in this area: think through ALL 9 cases. The system
+is designed so that **a caller asking for a human cannot end the call
+without the team being notified** (`log_escalation_started` is the floor).
+Don't introduce a code path that breaks that guarantee.
 
 ## The atomic-tool rule (the #1 bug source)
 
@@ -155,23 +225,101 @@ Cartesia adds in the dashboard but isn't in the `CallRequest.call_id` we
 receive. [linear_ticket.py](linear_ticket.py) auto-prepends it. If you
 build a new place that surfaces this URL, prepend `ac_` if missing.
 
-## Twilio Functions (post-handoff recording)
+## Twilio Functions and Asset (post-handoff recording + browser pickup)
 
 The `twilio_functions/` directory is the **source of truth**; Twilio's
 hosted copies must match. Edit here, paste into Twilio Console, redeploy.
 
-Two Functions in the Service `bc-voice-functions`:
-- `/conference-join` — TwiML for the conference-join number, enables
-  recording, sets up the recording callback URL.
+Functions in the Service `bc-voice-functions`:
+- `/conference-join` — TwiML for the conference-join number. Enables
+  recording, sets up the recording callback URL, and resolves the
+  conference name. Caller-ID resolution: tries `event.From`, then
+  `event.Caller`, then `event.OriginalFrom`, then `event.ForwardedFrom`,
+  then falls back to a Twilio REST API `calls(CallSid).fetch()` lookup.
+  This API path is necessary because Cartesia's `AgentTransferCall` was
+  observed to leave `event.From` empty on this webhook even though the
+  Call record itself carries the original caller. Accepts a `?conf=`
+  query string override (used by the REST-API force-redirect path).
 - `/recording-callback` — receives Twilio's `recordingStatusCallback` POST
   when the recording is ready, posts a Slack DM with caller number,
   duration, and listen link.
+- `/agent-token` — issues Twilio Voice SDK Access Tokens (120s TTL) to
+  the browser pickup page. Granted only `outgoingApplicationSid =
+  TWIML_APP_SID` so the browser can only dial through our TwiML App.
+- `/agent-dial` — TwiML the TwiML App invokes when the browser SDK calls
+  `device.connect({ params: { conference } })`. Drops the responder's
+  browser leg into the named conference.
 
-Both must be **Public visibility** in the Twilio Console (top-right of the
-editor) — without this, Twilio's voice network can't hit them.
+Asset:
+- `/agent-pickup.html` — static page the Slack button opens. Loads the
+  Voice JS SDK from `https://unpkg.com/@twilio/voice-sdk@2.10.0/dist/twilio.min.js`
+  (the official `sdk.twilio.com` URLs returned 403s during testing —
+  don't switch back without verifying). Reads `?conf`, `?customer`,
+  `?intent` from query string; displays customer + intent prominently;
+  10s watchdog flips a red "call the customer directly at +1..." banner
+  if the WebRTC handshake stalls.
 
-`SLACK_WEBHOOK_URL` must be set in the **Service's environment variables**
-(separate from your project `.env` — Twilio Functions can't read your `.env`).
+All Functions + the Asset must be **Public visibility** in the Twilio
+Console (top-right of the editor) — without this, Twilio's voice network
+can't hit them and the browser can't load the page.
+
+Service environment variables (NOT in project `.env` — Functions can't
+read your `.env`):
+- `SLACK_WEBHOOK_URL` — incoming webhook for `#ops-stale-tickets`. Used
+  by `recording-callback.js`. The Python code reads the same URL from
+  the project `.env`; keep both in sync when rotating.
+- `TWILIO_API_KEY_SID`, `TWILIO_API_KEY_SECRET`, `TWIML_APP_SID` — used
+  by `agent-token.js` to sign Access Tokens. `ACCOUNT_SID` is supplied
+  automatically by the Functions runtime.
+
+## Toll-free import flow (Cartesia ↔ Twilio integration)
+
+Toll-free `+1 (888) 460-4901` is imported into Cartesia via their
+preview "import Twilio number" API (3-step curl, documented in
+[README.md](README.md)). Cartesia handles the Twilio voice-webhook
+wiring internally — the toll-free's voice config in Twilio Console is
+managed by Cartesia. Don't change it by hand or you'll break inbound.
+
+Key resource IDs (stored only here for reference, not in code):
+- Provider ID: `ata_T2rKFZkdtiWwyUhP7i8osb` (the Twilio↔Cartesia connection).
+- Phone number ID: `ap_VtewXiUMyw4A84AdWBptP3` (the toll-free).
+- Agent ID: `agent_CicivQhXS56dgUehm3B1Ea`.
+
+The 218 area code number Cartesia provisioned originally is still
+assigned to the agent as a parked backup. Either number routes inbound
+calls to Alex. Release the 218 once toll-free has run a week of clean
+traffic.
+
+## Twilio API Key auth bug (workaround)
+
+Standard API Keys created in this Twilio account (parent or any
+subaccount) consistently fail Basic Auth with **error 20003
+"Authenticate"**, even when created programmatically via the REST API
+(no UI in the loop). Account-level Auth Tokens work fine. Reproducible
+with both the parent and a freshly-created subaccount. This appears to
+be a Twilio-side account flag or bug; needs a Twilio support ticket
+to resolve.
+
+**Workaround used by the Cartesia provider connect**: pass the
+**Account SID** as `api_key_sid` and the **Auth Token** as
+`api_key_secret`. Cartesia accepts this combo; Twilio recognizes
+Account SID + Auth Token as a valid Basic Auth credential pair. The
+provider already in production was created this way.
+
+Implication: when rotating Twilio creds, you rotate the **Auth Token**
+(coarser than rotating an API Key). To rotate, PATCH the Cartesia
+provider with the new Auth Token value:
+
+```bash
+curl -X PATCH "https://api.cartesia.ai/agents/phone-numbers/providers/ata_T2rKFZkdtiWwyUhP7i8osb" \
+  -H "Authorization: Bearer $CARTESIA_API_KEY" \
+  -H "Content-Type: application/json" \
+  -H "Cartesia-Version: 2025-04-16" \
+  -d '{"api_key_secret":"<new auth token>"}'
+```
+
+If Twilio resolves the API Key auth bug, swap back to a proper Standard
+API Key (api_key_sid=SK..., api_key_secret=secret) for tighter scoping.
 
 ## Twilio account must be Full (not Trial)
 

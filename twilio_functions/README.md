@@ -10,19 +10,35 @@ Twilio Console, redeploy.
 |------|------|---------|
 | `conference-join.js` | `/conference-join` | TwiML returned when the conference-join Twilio number receives an inbound call (i.e., when the bot transfers a customer in). Drops the caller into the per-call conference room, enables recording, sets up the recording-ready callback. |
 | `recording-callback.js` | `/recording-callback` | Twilio POSTs here when a conference recording finishes processing. Posts a Slack DM with the listen URL, caller number, and duration. |
-| `probe-accept.js` | `/probe-accept` | Gather-action handler for the responder press-1 gate. When the probe rings a responder's cell, they hear "Press 1 to accept" — if they press 1, this Function joins them into the conference. If voicemail picks up (can't press digits) or they press anything else, it hangs up cleanly. Prevents the voicemail-false-positive bug. |
+| `probe-accept.js` | `/probe-accept` | Gather-action handler for the responder press-1 gate. When the probe rings a responder's cell, they hear "Press 1 to accept" — if they press 1, this Function joins them into the conference. If voicemail picks up (can't press digits) or they press anything else, it hangs up cleanly. Prevents the voicemail-false-positive bug. Unused when `BROWSER_PICKUP=true`. |
+| `agent-token.js` | `/agent-token` | Browser-pickup mode only. Issues a short-lived (120s) Twilio Voice SDK Access Token to the `/agent-pickup.html` page so the responder can join the conference via WebRTC. |
+| `agent-dial.js` | `/agent-dial` | Browser-pickup mode only. TwiML hit by the TwiML App when the browser SDK's `device.connect()` fires. Drops the responder's browser leg into the named conference. |
+| `agent-pickup.html` | `/agent-pickup.html` | Browser-pickup mode only. Static Asset (not a Function). The page the Slack "Take call in browser" button opens. Loads the Voice JS SDK, fetches a token, joins the conference on click. |
 
 ## Service
 
-Both functions live in a single Twilio Service: **`bc-voice-functions`**.
+All functions live in a single Twilio Service: **`bc-voice-functions`**.
+`agent-pickup.html` is uploaded to the same Service as a public Asset.
 
 ## Environment variables
 
-The Service needs one env var:
+Set in Twilio Console → Functions → bc-voice-functions → Environment
+Variables. (Separate from the project `.env` — Twilio Functions can't
+read your `.env`.)
 
-- `SLACK_WEBHOOK_URL` — the incoming webhook for `#bc-support` (same one
-  used by the rest of the codebase). Set in Twilio Console → Functions →
-  bc-voice-functions → Environment Variables.
+Always required:
+- `SLACK_WEBHOOK_URL` — the incoming webhook for `#bc-support` (same
+  one used by the rest of the codebase).
+
+Required only for browser pickup (`BROWSER_PICKUP=true`):
+- `TWILIO_API_KEY_SID` — Console → Account → API keys & tokens → Create.
+- `TWILIO_API_KEY_SECRET` — shown ONCE at API Key creation. Save it.
+- `TWIML_APP_SID` — Console → Voice → TwiML → TwiML Apps → Create.
+  Friendly name `bc-browser-pickup`. Voice Request URL set to
+  `https://<your-functions-domain>/agent-dial`, HTTP POST.
+
+`ACCOUNT_SID` is provided automatically by the Functions runtime; no
+need to set it manually.
 
 ## Deploy workflow
 
@@ -35,6 +51,36 @@ The Service needs one env var:
 4. Click **Deploy All** at the bottom of the Service editor.
 5. URLs stay stable across deploys — no need to repoint the 917 webhook
    after each edit.
+
+### First-time deploy of the browser-pickup files
+
+When adding `agent-token.js`, `agent-dial.js`, and `agent-pickup.html`
+for the first time:
+
+1. **Service env vars first.** In the Service settings, add
+   `TWILIO_API_KEY_SID`, `TWILIO_API_KEY_SECRET`, and `TWIML_APP_SID`
+   (see Environment variables above).
+2. **Create the TwiML App** (Console → Voice → TwiML → TwiML Apps →
+   Create). Friendly name `bc-browser-pickup`. Leave the Voice Request
+   URL blank for now; you'll set it after the Functions are deployed.
+3. **Add the two new Functions** (`agent-token`, `agent-dial`) in the
+   bc-voice-functions Service. Paste contents, set visibility to
+   **Public**, Deploy All.
+4. **Add the HTML asset.** In the Service editor, Add → Upload File,
+   choose `agent-pickup.html`. Set its path to `/agent-pickup.html` and
+   visibility to **Public**. Deploy All.
+5. **Wire up the TwiML App.** Go back to the TwiML App you created in
+   step 2 and set Voice Request URL to
+   `https://<your-functions-domain>/agent-dial`, HTTP POST. Save.
+6. **Smoke test.** Open
+   `https://<your-functions-domain>/agent-pickup.html?conf=bc-test` in
+   a browser, click "Join call." You should connect to an empty
+   conference named `bc-test` (you can hear a hold message). Close the
+   tab to disconnect.
+7. **Flip the flag.** In the project `.env`, set `BROWSER_PICKUP=true`
+   and `TWILIO_FUNCTIONS_DOMAIN=<your-functions-domain>`. Then
+   `cartesia env set --from=.env --agent-id=<id>` and
+   `cartesia deploy`.
 
 ## 917 number wiring
 

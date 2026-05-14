@@ -38,6 +38,7 @@ Outcome = Literal[
     "closed_hours",
     "voicemail",
     "abandoned",
+    "escalation_pending",
     "other",
 ]
 
@@ -49,8 +50,39 @@ _OUTCOME_LABELS = {
     "closed_hours": "Hit closed-hours message",
     "voicemail": "Voicemail captured (after hours)",
     "abandoned": "Caller hung up mid-call",
+    "escalation_pending": "Escalation started — outcome pending",
     "other": "Other",
 }
+
+
+async def log_escalation_started(
+    *,
+    call_id: str,
+    caller_number: str,
+    intent_summary: str,
+) -> None:
+    """Fire a Linear ticket + Slack DM the moment escalate_to_human is
+    invoked, BEFORE the probe-wait runs.
+
+    Purpose: guarantee a paper trail even when downstream steps fail
+    silently (e.g. Cartesia's LLM hijacks the tool mid-wait and the call
+    drifts without a clean termination path). Worst case the team gets a
+    duplicate ticket per escalation (start + outcome) — strictly better
+    than zero tickets when something goes wrong.
+    """
+    recap = (
+        f"Caller asked to be escalated to a human. The bot has started "
+        f"the handoff flow but the outcome is pending — see follow-up "
+        f"ticket(s) for the final result."
+    )
+    await log_call_complete(
+        call_id=call_id,
+        caller_number=caller_number,
+        caller_name=None,
+        intent_summary=intent_summary,
+        outcome="escalation_pending",
+        recap=recap,
+    )
 
 
 async def log_call_complete(

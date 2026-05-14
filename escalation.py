@@ -21,6 +21,7 @@ Why passthrough instead of loopback:
 import asyncio
 import logging
 import os
+import re
 import time
 from typing import Annotated, Optional
 from urllib.parse import quote
@@ -31,21 +32,35 @@ from line.llm_agent.tools.decorators import passthrough_tool
 from line.voice_agent_app import CallRequest
 from twilio.rest import Client
 
-from linear_ticket import log_call_complete
+from linear_ticket import log_call_complete, log_escalation_started
 
 logger = logging.getLogger(__name__)
 
 
-PROBE_TIMEOUT_SECONDS = 40  # upper bound on how long we wait for someone to answer
+PROBE_TIMEOUT_SECONDS = 60  # upper bound on how long we wait for someone to answer
 POLL_INTERVAL_SECONDS = 1
 
-# Filler audio played to the customer at ~10s intervals during the probe
-# wait, so they don't sit in 10+ seconds of pure silence and assume the
-# call dropped. Spoken in order; varied wording so it doesn't sound like
-# a loop. The list covers the full PROBE_TIMEOUT_SECONDS window — first
-# filler addresses "are you still there?" head-on so callers don't have
-# to ask.
-PROBE_FILLER_INTERVAL_SECONDS = 10
+# Module-level reference to keep probe tasks alive across LLM hijacks.
+# Background: escalate_to_human is an async generator. When the LLM
+# hijacks the tool mid-wait (caller spoke during a filler gap), Cartesia
+# may garbage-collect the generator. Without an external reference, the
+# probe task spawned inside it could be cancelled too — and the
+# force-redirect to the conference would never fire. Storing the task
+# here pins it until it completes naturally (participant join or
+# timeout). The done-callback cleans up so the set doesn't grow.
+_ACTIVE_PROBE_TASKS: set = set()
+
+# Filler audio played to the customer during the probe wait. Spoken in
+# order; varied wording so it doesn't sound like a loop. The list covers
+# the full PROBE_TIMEOUT_SECONDS window — first filler addresses "are you
+# still there?" head-on so callers don't have to ask.
+#
+# Interval is short on purpose: longer silent gaps between fillers let
+# unrelated room noise / side conversations leak into Cartesia's STT,
+# which can trigger the LLM mid-tool and break out of the escalate flow.
+# Keeping each gap to ~1s vs filler ~3s gives Cartesia almost no quiet
+# window to misinterpret as user input.
+PROBE_FILLER_INTERVAL_SECONDS = 4
 # Wording deliberately avoids "one moment" / "one second" — those phrases
 # are already in the escalation announcements (e.g., "Sure — one moment,
 # connecting you to our team."), so echoing them in the first filler
@@ -55,6 +70,16 @@ PROBE_FILLERS = [
     "Bear with me — almost there.",
     "Hang tight, getting someone on the line.",
     "Really appreciate your patience — won't be long.",
+    "Still trying — should just be a few more seconds.",
+    "Thanks for holding — really close now.",
+    "Just a moment more — pinging the team.",
+    "Almost there — appreciate you staying on.",
+    "Hang in there — should just be a few more seconds.",
+    "Bear with me — getting someone over now.",
+    "Still here with you — won't be much longer.",
+    "Almost connected — thanks for holding.",
+    "Just another second — really appreciate your patience.",
+    "Hold tight — connecting any moment now.",
 ]
 
 # Spoken on both the probe-failed path AND the misconfigured-target path
@@ -74,6 +99,55 @@ def _env(name: str, *, required: bool = True) -> str:
     if required and not val:
         raise RuntimeError(f"Missing required env var: {name}")
     return val
+
+
+# === Pattern-based escalation detector =====================================
+#
+# Case 9 guarantee: if the customer says any of these phrases, the
+# escalation flow runs regardless of whether the LLM decided to call
+# escalate_to_human. The main.py wrapper detects this on each
+# UserTurnEnded event and bypasses the LLM if matched + no escalation
+# is already in progress. Better to over-match (occasional unwanted
+# escalation that no-ops on the second trigger) than to miss a genuine
+# human request.
+_ESCALATION_PATTERNS = [
+    # "speak to / talk to / chat with a human / representative / etc."
+    # Verb-combined forms cover the legitimate "real person" requests
+    # like "I want to speak to a real person" — there's no need for a
+    # standalone "real/actual/live person" pattern that would also
+    # match "Are you a real person?" (an AI-identity question, NOT an
+    # escalation request — see Bot Identity section in main.py prompt).
+    re.compile(
+        r"\b(speak|talk|chat|connect|put|get|transfer|hand)\s+"
+        r"(me\s+)?(to|with|over|through)\s+"
+        r"(an?\s+)?"
+        r"(human|person|someone|representative|rep|agent|manager|supervisor|"
+        r"real\s+person|real\s+human|live\s+person|live\s+agent|"
+        r"actual\s+human|actual\s+person)\b",
+        re.I,
+    ),
+    # "want / need a human / representative / etc."
+    re.compile(
+        r"\b(want|need|prefer|require)\s+"
+        r"(a\s+|an\s+|to\s+(speak|talk)\s+to\s+a?\s*)?"
+        r"(human|person|representative|rep|agent|manager|supervisor)\b",
+        re.I,
+    ),
+    # Standalone keywords that on their own are clear enough signals.
+    re.compile(r"\brepresentative\b", re.I),
+    re.compile(r"\bhuman\s+being\b", re.I),
+]
+
+
+def user_wants_human(text: str) -> bool:
+    """True if the caller's transcribed turn unambiguously asks for a
+    human. Called from main.py's per-turn wrapper as the Case 9 backstop
+    — when this returns True and no escalation is already in progress,
+    the wrapper bypasses the LLM and runs the escalation flow itself.
+    """
+    if not text:
+        return False
+    return any(p.search(text) for p in _ESCALATION_PATTERNS)
 
 
 def _derive_conf_name(caller_number: str) -> str:
@@ -96,7 +170,223 @@ def _derive_conf_name(caller_number: str) -> str:
     return f"bc-{digits}" if digits else "bc-active"
 
 
-def make_escalate_tool(call_request: CallRequest, completed_flag=None):
+async def run_escalation_flow(
+    *,
+    call_id: str,
+    caller_number: str,
+    spoken_announcement: str,
+    intent_summary: str,
+    completed_flag=None,
+    escalation_status=None,
+):
+    """The escalation flow body. Yields agent events. Called from two
+    places:
+      1. The escalate_to_human tool (LLM-initiated escalation).
+      2. The main.py wrapper's Case 9 backstop (pattern-detected
+         escalation that fires regardless of LLM decision).
+
+    Single source of truth for the escalation behavior. The flow:
+    speak the announcement → fire Slack ping → log "pending" Linear
+    ticket → wait for a human (browser pickup or phone probe) → either
+    transfer the caller to the conference OR speak the "lines are busy"
+    callback intake prompt.
+
+    `escalation_status` is an optional dict with key "in_progress". Set
+    True at entry, cleared False at exit so end_call_with_goodbye can
+    detect Case 8 (LLM hijack ending the call mid-escalation).
+    """
+    if escalation_status is not None:
+        escalation_status["in_progress"] = True
+    try:
+        logger.info(
+            "escalation flow START call_id=%s intent=%r",
+            call_id,
+            intent_summary,
+        )
+
+        # Step 1 — announce to the caller. interruptible=False so the
+        # caller hears the full sentence before the silent probe pause.
+        yield AgentSendText(text=spoken_announcement, interruptible=False)
+
+        # Step 2 — fire the team Slack ping. AWAITED so it can't be
+        # silently dropped (this was a bug previously when it was
+        # fire-and-forget).
+        demo_mode = (
+            os.environ.get("DEMO_MODE", "").strip().lower() in ("1", "true", "yes")
+        )
+        browser_pickup = (
+            os.environ.get("BROWSER_PICKUP", "").strip().lower()
+            in ("1", "true", "yes")
+        )
+        conf_name = _derive_conf_name(caller_number)
+
+        # Build the browser pickup URL the Slack button opens. Requires
+        # TWILIO_FUNCTIONS_DOMAIN — if it's missing while BROWSER_PICKUP
+        # is on, log loudly and fall back to the phone probe so the call
+        # still gets escalated rather than silently stranding the caller.
+        #
+        # We also pass caller + intent through the URL so the pickup
+        # page can display them. That way if the WebRTC join fails or
+        # the conference is empty when the responder arrives, the
+        # responder still sees who to call back and what they want.
+        pickup_url: Optional[str] = None
+        if browser_pickup and not demo_mode:
+            functions_domain = os.environ.get("TWILIO_FUNCTIONS_DOMAIN", "").strip()
+            if functions_domain:
+                pickup_url = (
+                    f"https://{functions_domain}/agent-pickup.html"
+                    f"?conf={quote(conf_name)}"
+                    f"&customer={quote(caller_number)}"
+                    f"&intent={quote(intent_summary[:140])}"
+                )
+            else:
+                logger.error(
+                    "BROWSER_PICKUP=true but TWILIO_FUNCTIONS_DOMAIN unset "
+                    "— falling back to phone probe"
+                )
+                browser_pickup = False
+
+        slack_url = os.environ.get("SLACK_WEBHOOK_URL", "")
+        if slack_url:
+            try:
+                await _send_slack_ping(
+                    slack_url,
+                    intent_summary,
+                    caller_number,
+                    demo_mode,
+                    pickup_url=pickup_url,
+                )
+            except Exception as e:
+                logger.warning("Slack ping failed (non-fatal): %s", e)
+        else:
+            logger.warning("SLACK_WEBHOOK_URL not set — no team ping fired")
+
+        # Fire a "pending" Linear ticket immediately so the team always
+        # has a paper trail for this escalation, even if downstream
+        # steps silently fail (LLM mid-tool hijack, Cartesia teardown,
+        # etc.). The transfer-success / callback paths fire their own
+        # final-outcome tickets later; duplication is intentional.
+        try:
+            await log_escalation_started(
+                call_id=call_id,
+                caller_number=caller_number,
+                intent_summary=intent_summary,
+            )
+        except Exception as e:
+            logger.warning("log_escalation_started failed (non-fatal): %s", e)
+
+        # Step 3 — run the probe. Yield filler audio every
+        # PROBE_FILLER_INTERVAL_SECONDS so the customer hears something
+        # instead of dead silence while we wait for a teammate. Browser-
+        # pickup mode skips the outbound cell calls — the Slack button
+        # is the trigger. Both paths share the same conference-
+        # participant poll as the success signal.
+        if demo_mode:
+            logger.info("DEMO_MODE: sleeping ~5s, then unavailable")
+            await asyncio.sleep(5)
+            available = False
+        else:
+            if browser_pickup:
+                logger.info(
+                    "BROWSER_PICKUP: waiting for responder to click "
+                    "Slack button and join conf=%s",
+                    conf_name,
+                )
+                probe_task = asyncio.create_task(
+                    _wait_for_browser_pickup(conf_name, call_id, completed_flag)
+                )
+                # Pin to module-level set so an LLM hijack that cancels
+                # this generator doesn't also cancel the task. The task
+                # then continues polling and fires the force-redirect
+                # independently — guaranteeing the customer reaches the
+                # human as soon as the human shows up.
+                _ACTIVE_PROBE_TASKS.add(probe_task)
+                probe_task.add_done_callback(_ACTIVE_PROBE_TASKS.discard)
+            else:
+                probe_task = asyncio.create_task(
+                    _real_probe(call_id, caller_number)
+                )
+            filler_idx = 0
+            while True:
+                try:
+                    available = await asyncio.wait_for(
+                        asyncio.shield(probe_task),
+                        timeout=PROBE_FILLER_INTERVAL_SECONDS,
+                    )
+                    break
+                except asyncio.TimeoutError:
+                    if filler_idx < len(PROBE_FILLERS) and not probe_task.done():
+                        yield AgentSendText(
+                            text=PROBE_FILLERS[filler_idx],
+                            interruptible=False,
+                        )
+                        filler_idx += 1
+                    # If we're out of fillers, just loop quietly until
+                    # probe_task completes (either picks up or times out
+                    # at PROBE_TIMEOUT_SECONDS).
+
+        # Step 4 — speak the outcome.
+        #
+        # Important ordering: check the transfer target BEFORE logging
+        # the "transferred" Linear ticket or setting completed_flag. If
+        # CONFERENCE_JOIN_NUMBER is unset (misconfig), the probe
+        # succeeded but we have nowhere to send the caller — we must
+        # fall back to the ticket flow WITHOUT polluting Linear with a
+        # fake transfer ticket and WITHOUT blinding the abandoned-call
+        # wrapper.
+        target = os.environ.get("CONFERENCE_JOIN_NUMBER", "") if available else ""
+
+        if available and target:
+            # Real transfer: log first (the transfer kills our agent leg),
+            # mark complete (so the CallEnded wrapper doesn't double-log),
+            # announce, then transfer.
+            await log_call_complete(
+                call_id=call_id,
+                caller_number=caller_number,
+                caller_name=None,  # we don't ask before transferring
+                intent_summary=intent_summary,
+                outcome="transferred",
+                recap=(
+                    f"Caller was bridged to a human after escalation. "
+                    f"Intent: {intent_summary}"
+                ),
+            )
+            if completed_flag is not None:
+                completed_flag[0] = True
+            yield AgentSendText(
+                text="I'm connecting you to my human supervisor now.",
+                interruptible=False,
+            )
+            yield AgentTransferCall(target_phone_number=target)
+        else:
+            # Two cases land here:
+            #   (a) Probe failed (no one picked up within timeout)
+            #   (b) Probe succeeded but CONFERENCE_JOIN_NUMBER is unset
+            # Both fall through to the callback/email flow with the
+            # same spoken message. The LLM's record_followup +
+            # end_call_with_goodbye will produce the correct final
+            # Linear ticket — don't log anything here.
+            if available and not target:
+                logger.error(
+                    "Probe succeeded but CONFERENCE_JOIN_NUMBER unset — "
+                    "can't transfer. Falling through to ticket flow."
+                )
+            yield AgentSendText(
+                text=TEAM_UNAVAILABLE_MESSAGE,
+                interruptible=False,
+            )
+    finally:
+        # Always clear in_progress, even if the generator is cancelled
+        # mid-flow by an LLM hijack. This way end_call_with_goodbye
+        # firing after a hijack-and-give-up correctly sees "not in
+        # escalation anymore" and ends normally.
+        if escalation_status is not None:
+            escalation_status["in_progress"] = False
+
+
+def make_escalate_tool(
+    call_request: CallRequest, completed_flag=None, escalation_status=None
+):
     """Build the escalate_to_human tool bound to this call's CallRequest.
 
     `completed_flag` is the same single-element list shared with
@@ -104,6 +394,11 @@ def make_escalate_tool(call_request: CallRequest, completed_flag=None):
     The transfer-success path here logs to Linear and then ends the call
     via AgentTransferCall, which fires CallEnded — set the flag so the
     wrapper doesn't double-log an "abandoned" ticket.
+
+    `escalation_status` is an optional dict with key "in_progress",
+    shared with end_call_with_goodbye (for the Case 8 hijack-recovery
+    check) and main.py's wrapper (for the Case 9 no-op-on-duplicate
+    check).
     """
 
     caller_number = call_request.from_ or "unknown"
@@ -144,109 +439,124 @@ def make_escalate_tool(call_request: CallRequest, completed_flag=None):
         The unavailable speech already asked for the name, so don't
         re-ask — just take the response and proceed to the number.
         """
-        logger.info(
-            "escalate_to_human START call_id=%s intent=%r", call_id, intent_summary
-        )
-
-        # Step 1 — announce to the caller. interruptible=False so the
-        # caller hears the full sentence before the silent probe pause.
-        yield AgentSendText(text=spoken_announcement, interruptible=False)
-
-        # Step 2 — fire the team Slack ping. AWAITED so it can't be silently
-        # dropped (this was a bug previously when it was fire-and-forget).
-        demo_mode = (
-            os.environ.get("DEMO_MODE", "").strip().lower() in ("1", "true", "yes")
-        )
-        slack_url = os.environ.get("SLACK_WEBHOOK_URL", "")
-        if slack_url:
-            try:
-                await _send_slack_ping(
-                    slack_url, intent_summary, caller_number, demo_mode
-                )
-            except Exception as e:
-                logger.warning("Slack ping failed (non-fatal): %s", e)
-        else:
-            logger.warning("SLACK_WEBHOOK_URL not set — no team ping fired")
-
-        # Step 3 — run the probe. Yield filler audio every
-        # PROBE_FILLER_INTERVAL_SECONDS so the customer hears something
-        # instead of dead silence while we wait for a teammate to pick up.
-        if demo_mode:
-            logger.info("DEMO_MODE: sleeping ~5s, then unavailable")
-            await asyncio.sleep(5)
-            available = False
-        else:
-            probe_task = asyncio.create_task(_real_probe(call_id, caller_number))
-            filler_idx = 0
-            while True:
-                try:
-                    available = await asyncio.wait_for(
-                        asyncio.shield(probe_task),
-                        timeout=PROBE_FILLER_INTERVAL_SECONDS,
-                    )
-                    break
-                except asyncio.TimeoutError:
-                    if filler_idx < len(PROBE_FILLERS) and not probe_task.done():
-                        yield AgentSendText(
-                            text=PROBE_FILLERS[filler_idx],
-                            interruptible=False,
-                        )
-                        filler_idx += 1
-                    # If we're out of fillers, just loop quietly until
-                    # probe_task completes (either picks up or times out
-                    # at PROBE_TIMEOUT_SECONDS).
-
-        # Step 4 — speak the outcome.
-        #
-        # Important ordering: check the transfer target BEFORE logging
-        # the "transferred" Linear ticket or setting completed_flag. If
-        # CONFERENCE_JOIN_NUMBER is unset (misconfig), the probe succeeded
-        # but we have nowhere to send the caller — we must fall back to
-        # the ticket flow WITHOUT polluting Linear with a fake transfer
-        # ticket and WITHOUT blinding the abandoned-call wrapper.
-        target = os.environ.get("CONFERENCE_JOIN_NUMBER", "") if available else ""
-
-        if available and target:
-            # Real transfer: log first (the transfer kills our agent leg),
-            # mark complete (so the CallEnded wrapper doesn't double-log),
-            # announce, then transfer.
-            await log_call_complete(
-                call_id=call_id,
-                caller_number=caller_number,
-                caller_name=None,  # we don't ask before transferring
-                intent_summary=intent_summary,
-                outcome="transferred",
-                recap=(
-                    f"Caller was bridged to a human after escalation. "
-                    f"Intent: {intent_summary}"
-                ),
+        # No-op if an escalation is already running (race with the Case
+        # 9 wrapper trigger, or the LLM calling this tool twice in a
+        # row). The active one continues; this call returns immediately.
+        if escalation_status is not None and escalation_status.get("in_progress"):
+            logger.info(
+                "escalate_to_human called but escalation already in progress — "
+                "skipping duplicate"
             )
-            if completed_flag is not None:
-                completed_flag[0] = True
-            yield AgentSendText(
-                text="Looks like someone's available — connecting you now.",
-                interruptible=False,
-            )
-            yield AgentTransferCall(target_phone_number=target)
-        else:
-            # Two cases land here:
-            #   (a) Probe failed (no one picked up within timeout)
-            #   (b) Probe succeeded but CONFERENCE_JOIN_NUMBER is unset
-            # Both fall through to the callback/email flow with the same
-            # spoken message. The LLM's record_followup + end_call_with_goodbye
-            # will produce the correct final Linear ticket — don't log
-            # anything here.
-            if available and not target:
-                logger.error(
-                    "Probe succeeded but CONFERENCE_JOIN_NUMBER unset — "
-                    "can't transfer. Falling through to ticket flow."
-                )
-            yield AgentSendText(
-                text=TEAM_UNAVAILABLE_MESSAGE,
-                interruptible=False,
-            )
+            return
+
+        async for ev in run_escalation_flow(
+            call_id=call_id,
+            caller_number=caller_number,
+            spoken_announcement=spoken_announcement,
+            intent_summary=intent_summary,
+            completed_flag=completed_flag,
+            escalation_status=escalation_status,
+        ):
+            yield ev
 
     return escalate_to_human
+
+
+# === Browser-pickup probe ====================================================
+
+
+async def _wait_for_browser_pickup(
+    conf_name: str, call_id: str, completed_flag
+) -> bool:
+    """Browser-pickup mode: skip placing outbound cell calls and just
+    wait for the Slack-button responder to join the conference via the
+    Twilio Voice JS SDK.
+
+    The Slack ping was already sent with a "Take call in browser" button
+    by the time we get here. The responder clicks, lands on
+    /agent-pickup.html, clicks Join, and the browser SDK pulls them into
+    this conference. We detect the join via the same participant poll
+    used by the phone probe.
+
+    On success, this also schedules a DELAYED force-redirect of the
+    customer's call to the conference via Twilio REST API. The delay
+    matters: the escalate_to_human generator yields a "connecting you to
+    my human supervisor" speech right after this returns True, and we
+    want that speech to actually play before the call is moved. The
+    delayed redirect checks completed_flag before firing — in the happy
+    path the speech yields and AgentTransferCall sets the flag, the
+    redirect skips itself. In the LLM-hijack path the flag stays False
+    and the redirect fires, guaranteeing the customer reaches the human
+    no matter what Cartesia's LLM did.
+
+    Returns True if someone joins within PROBE_TIMEOUT_SECONDS, False
+    otherwise (caller then falls through to callback intake, same as the
+    phone-probe miss path).
+    """
+    twilio_sid = _env("TWILIO_ACCOUNT_SID")
+    twilio_token = _env("TWILIO_AUTH_TOKEN")
+    client = Client(twilio_sid, twilio_token)
+    joined = await _wait_for_participant(client, conf_name, PROBE_TIMEOUT_SECONDS)
+    if joined:
+        redirect_task = asyncio.create_task(
+            _delayed_force_redirect(
+                client, call_id, conf_name, completed_flag, delay_seconds=4
+            )
+        )
+        # Pin so an LLM-hijack-induced generator cancel doesn't kill it.
+        _ACTIVE_PROBE_TASKS.add(redirect_task)
+        redirect_task.add_done_callback(_ACTIVE_PROBE_TASKS.discard)
+    return joined
+
+
+async def _delayed_force_redirect(
+    client, call_id: str, conf_name: str, completed_flag, delay_seconds: float
+) -> None:
+    """Wait `delay_seconds`, then force the customer's call into the
+    conference via Twilio REST API — but only if the happy-path
+    AgentTransferCall didn't already do it (signaled via completed_flag).
+    """
+    await asyncio.sleep(delay_seconds)
+    if completed_flag is not None and completed_flag[0]:
+        logger.info(
+            "Force-redirect skipped — AgentTransferCall already moved the call"
+        )
+        return
+    await _force_redirect_to_conference(client, call_id, conf_name)
+
+
+async def _force_redirect_to_conference(client, call_id: str, conf_name: str) -> None:
+    """Use Twilio's REST API to move the customer's call leg into the
+    conference, bypassing Cartesia. Best-effort: any failure logs and
+    moves on.
+    """
+    functions_domain = os.environ.get("TWILIO_FUNCTIONS_DOMAIN", "").strip()
+    if not functions_domain:
+        logger.warning(
+            "TWILIO_FUNCTIONS_DOMAIN unset — can't issue force-redirect"
+        )
+        return
+
+    # call_id from CallRequest may or may not include Cartesia's "ac_"
+    # prefix; Twilio's REST API needs the raw CallSid (CAxxxx...).
+    twilio_call_sid = call_id[3:] if call_id.startswith("ac_") else call_id
+    redirect_url = (
+        f"https://{functions_domain}/conference-join?conf={quote(conf_name)}"
+    )
+    try:
+        await asyncio.to_thread(
+            client.calls(twilio_call_sid).update,
+            method="POST",
+            url=redirect_url,
+        )
+        logger.info(
+            "Force-redirect: call=%s -> conf=%s", twilio_call_sid, conf_name
+        )
+    except Exception as e:
+        logger.warning(
+            "Force-redirect failed (non-fatal, call may already be moved): %s",
+            e,
+        )
 
 
 # === Real-mode probe (Twilio conference) ====================================
@@ -396,23 +706,82 @@ def _cancel_call(client, sid: str) -> None:
 
 
 async def _send_slack_ping(
-    webhook_url: str, intent_summary: str, caller_number: str, demo_mode: bool
+    webhook_url: str,
+    intent_summary: str,
+    caller_number: str,
+    demo_mode: bool,
+    *,
+    pickup_url: Optional[str] = None,
 ) -> None:
-    if demo_mode:
-        body = (
-            f":telephone_receiver: *Bot escalated (DEMO mode)*\n"
-            f"*Caller:* {caller_number}\n"
-            f"*Wants:* {intent_summary}\n"
-            f"_No real probe — caller will be led into callback intake._"
-        )
+    """Notify the team that a caller is being escalated.
+
+    If pickup_url is provided (BROWSER_PICKUP mode), the message renders
+    as Block Kit with a primary "Take call in browser" button that opens
+    the per-call pickup page. Otherwise we send a plain-text message —
+    matches the legacy phone-probe flow where the cells ring directly.
+    """
+    if pickup_url:
+        payload = {
+            "text": f":telephone_receiver: Incoming BC call from {caller_number}",
+            "blocks": [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": (
+                            f":telephone_receiver: *Incoming Basic Capital call*\n"
+                            f"*Caller:* {caller_number}\n"
+                            f"*Wants:* {intent_summary}"
+                        ),
+                    },
+                },
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "style": "primary",
+                            "text": {
+                                "type": "plain_text",
+                                "text": "Take call in browser",
+                            },
+                            "url": pickup_url,
+                        }
+                    ],
+                },
+                {
+                    "type": "context",
+                    "elements": [
+                        {
+                            "type": "mrkdwn",
+                            "text": (
+                                "_First to click joins the conference. "
+                                "Falls back to callback intake if nobody clicks in ~60s._"
+                            ),
+                        }
+                    ],
+                },
+            ],
+        }
+    elif demo_mode:
+        payload = {
+            "text": (
+                f":telephone_receiver: *Bot escalated (DEMO mode)*\n"
+                f"*Caller:* {caller_number}\n"
+                f"*Wants:* {intent_summary}\n"
+                f"_No real probe — caller will be led into callback intake._"
+            )
+        }
     else:
-        body = (
-            f":telephone_receiver: *Incoming Basic Capital call*\n"
-            f"*Caller:* {caller_number}\n"
-            f"*Wants:* {intent_summary}\n"
-            f"_Phones ringing now — answer to be placed in the conference._"
-        )
+        payload = {
+            "text": (
+                f":telephone_receiver: *Incoming Basic Capital call*\n"
+                f"*Caller:* {caller_number}\n"
+                f"*Wants:* {intent_summary}\n"
+                f"_Phones ringing now — answer to be placed in the conference._"
+            )
+        }
     async with httpx.AsyncClient(timeout=5) as client:
-        resp = await client.post(webhook_url, json={"text": body})
+        resp = await client.post(webhook_url, json=payload)
     resp.raise_for_status()
     logger.info("Slack ping sent (status=%s)", resp.status_code)
