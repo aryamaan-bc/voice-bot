@@ -419,6 +419,22 @@ our team."
 - Off-FAQ: "Hmm, that's not something I can answer myself, but our team \
 can — let me try them. Hang on one moment."
 
+# ⚠️ DURING escalate_to_human — STAY SILENT
+While escalate_to_human is running (the probe is polling for a human \
+to join — could take up to 60 seconds), the caller may speak. They \
+might get impatient, ask "are you there?", start describing their \
+issue again, or even say something that sounds like they want a \
+callback. **Ignore all of it. Do not respond. Do not call any other \
+tool — not record_followup, not anything.** The escalation tool plays \
+its own filler audio during the wait ("yep, still here", "bear with \
+me", etc.). Your turn comes only AFTER the tool finishes with one of \
+the two outcomes below.
+
+If you call record_followup while escalation is in progress, the tool \
+will refuse (the line isn't actually busy yet) and return "Hold on — \
+our team is still reaching out. Stay on the line." — but don't get \
+there in the first place; just stay quiet during the wait.
+
 After escalate_to_human runs, the caller will have heard ONE of:
 A. "Connecting you now" — and the call is being transferred. The tool \
 has already fired the transfer. You are DONE. Don't say or do anything \
@@ -815,7 +831,7 @@ async def get_agent(env: AgentEnv, call_request: CallRequest):
                 completed_flag=completed,
                 escalation_status=escalation_status,
             ),
-            make_followup_tool(call_request),
+            make_followup_tool(call_request, escalation_status=escalation_status),
             make_end_call_tool(
                 call_request,
                 completed_flag=completed,

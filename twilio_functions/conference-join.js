@@ -48,13 +48,15 @@ exports.handler = async function (context, event, callback) {
     `https://${context.DOMAIN_NAME}/recording-callback` +
     `?customer=${encodeURIComponent(customerNumber)}`;
 
-  // Safety cap. The customer's call leg auto-ends after 10 minutes
-  // regardless. Handles the orphan case where a human joined and then
-  // dropped (browser crash, wifi blip) leaving the customer alone in
-  // an active-but-empty conference with no waitUrl playing. Without
-  // this, the customer would sit in silence until they hang up.
+  // Safety cap. The customer's call leg auto-ends after this many
+  // seconds regardless. Mostly relevant to the orphan case (human
+  // joined and dropped, leaving the customer alone in a silent
+  // conference). 60 minutes is long enough that a normal support
+  // conversation isn't capped, while still bounding the orphan case.
+  // Lower if you ever see customers stuck in orphan silence; raise
+  // if real calls are getting auto-disconnected.
   const twiml = new Twilio.twiml.VoiceResponse();
-  twiml.dial({ timeLimit: 600 }).conference(
+  twiml.dial({ timeLimit: 3600 }).conference(
     {
       record: 'record-from-start',
       recordingStatusCallback: callbackUrl,

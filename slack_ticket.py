@@ -21,8 +21,20 @@ from line.voice_agent_app import CallRequest
 logger = logging.getLogger(__name__)
 
 
-def make_followup_tool(call_request: CallRequest):
-    """Build the record_followup tool bound to this call's CallRequest."""
+def make_followup_tool(call_request: CallRequest, escalation_status=None):
+    """Build the record_followup tool bound to this call's CallRequest.
+
+    `escalation_status` is an optional dict (shared with escalate_to_human
+    and end_call_with_goodbye). If escalation_status["in_progress"] is
+    True when the LLM calls this tool, the call is a NO-OP — we suppress
+    the Slack ticket and tell the LLM to stay on hold. This catches the
+    scenario where the caller speaks during the probe wait, the LLM
+    interprets their speech as a callback request, and tries to enter
+    callback intake even though the line isn't busy and a human is
+    about to join. After the probe times out (in_progress=False), this
+    tool resumes normal behavior so the legitimate callback flow still
+    works.
+    """
 
     call_id = call_request.call_id
     caller_number = call_request.from_ or "unknown"
@@ -67,6 +79,23 @@ def make_followup_tool(call_request: CallRequest):
         wording to use when confirming to the caller — or an email
         fallback if Slack is unreachable.
         """
+        # If escalation is still in progress (probe waiting for a human
+        # to join), this tool fires only because the LLM hijacked from
+        # the caller's mid-wait speech. The line isn't actually busy and
+        # a human might be about to join — refuse to enter callback
+        # intake, no Slack ticket, tell the LLM to stay quiet.
+        if escalation_status is not None and escalation_status.get("in_progress"):
+            logger.warning(
+                "record_followup called while escalation in progress "
+                "(call_id=%s) — suppressing Slack ticket; LLM should "
+                "return to silent hold mode",
+                call_id,
+            )
+            return (
+                "Hold on — our team is still reaching out. "
+                "Stay on the line."
+            )
+
         webhook_url = os.environ.get("SLACK_WEBHOOK_URL")
         if not webhook_url:
             logger.error("SLACK_WEBHOOK_URL not set — falling back to email")

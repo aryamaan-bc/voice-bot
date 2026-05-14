@@ -2,14 +2,28 @@
 
 The tool handles the entire escalation flow itself:
   1. Speaks an announcement to the caller (no LLM-text-before-tool race).
-  2. Fires a Slack call-ping to the team.
-  3. Runs the probe (real Twilio in production; 5s sleep in demo mode).
-  4. Speaks the outcome:
-       - Available: "Connecting you now" + AgentTransferCall.
-       - Unavailable: "Sorry, all our lines are busy — what's your full
-         name?" Then the LLM handles callback intake (name + phone,
-         calling record_followup). Email path still works if the caller
+  2. Fires a Slack call-ping with a "Take call in browser" button.
+  3. Runs the probe (polls the Twilio conference for a participant;
+     5s sleep in demo mode).
+  4. Resolves:
+       - Available (rep joined): waits for the announcement to finish
+         playing, then force-redirects the customer's call to the
+         conference via Twilio REST API call.update. Bridges the caller
+         to the rep.
+       - Unavailable (probe timed out OR force-redirect failed): speaks
+         "Sorry, all our lines are busy — what's your full name?" Then
+         the LLM handles callback intake (name + phone, calling
+         record_followup). Email path still works if the caller
          proactively asks, but the bot doesn't offer it.
+
+Why force-redirect instead of Cartesia's AgentTransferCall:
+  AgentTransferCall issues `<Dial>` from the customer's call leg.
+  Twilio's voice routing has been observed to return "busy" when the
+  originating call came in on a toll-free, killing the customer's call
+  with no fallback. The REST API call.update mechanism doesn't place a
+  new outbound call — it just rewrites the existing call's TwiML — so
+  it sidesteps the toll-free routing issue entirely. Failures here are
+  also detectable, so we can fall through to callback intake.
 
 Why passthrough instead of loopback:
   LLMs (Haiku and friends) unreliably interleave text generation with
@@ -27,7 +41,7 @@ from typing import Annotated, Optional
 from urllib.parse import quote
 
 import httpx
-from line.events import AgentSendText, AgentTransferCall
+from line.events import AgentSendText
 from line.llm_agent.tools.decorators import passthrough_tool
 from line.voice_agent_app import CallRequest
 from twilio.rest import Client
@@ -82,11 +96,11 @@ PROBE_FILLERS = [
     "Hold tight — connecting any moment now.",
 ]
 
-# Spoken on both the probe-failed path AND the misconfigured-target path
-# (probe succeeded but CONFERENCE_JOIN_NUMBER is empty — no destination
-# to transfer to). The bot leads the caller straight into callback
-# intake (name + number → record_followup). No voicemail/email branches
-# — simpler flow, single happy path.
+# Spoken on the probe-failed path (nobody clicked the Slack button
+# within PROBE_TIMEOUT_SECONDS) AND when the force-redirect REST API
+# call fails (call already ended, Twilio outage). The bot leads the
+# caller straight into callback intake (name + number → record_followup).
+# No voicemail/email branches — simpler flow, single happy path.
 TEAM_UNAVAILABLE_MESSAGE = (
     "Sorry, all our lines are busy right now. Let me grab your "
     "name and a callback number so someone can follow up on the "
@@ -206,6 +220,10 @@ async def run_escalation_flow(
 
         # Step 1 — announce to the caller. interruptible=False so the
         # caller hears the full sentence before the silent probe pause.
+        # Track start time so the success path knows how long the
+        # announcement has been playing (we don't get a speech-done
+        # event from Cartesia, so we estimate via elapsed time).
+        announcement_start = time.monotonic()
         yield AgentSendText(text=spoken_announcement, interruptible=False)
 
         # Step 2 — fire the team Slack ping. AWAITED so it can't be
@@ -293,7 +311,14 @@ async def run_escalation_flow(
                     conf_name,
                 )
                 probe_task = asyncio.create_task(
-                    _wait_for_browser_pickup(conf_name, call_id, completed_flag)
+                    _wait_for_browser_pickup(
+                        conf_name,
+                        call_id,
+                        caller_number,
+                        intent_summary,
+                        completed_flag,
+                        escalation_status,
+                    )
                 )
                 # Pin to module-level set so an LLM hijack that cancels
                 # this generator doesn't also cancel the task. The task
@@ -327,50 +352,90 @@ async def run_escalation_flow(
 
         # Step 4 — speak the outcome.
         #
-        # Important ordering: check the transfer target BEFORE logging
-        # the "transferred" Linear ticket or setting completed_flag. If
-        # CONFERENCE_JOIN_NUMBER is unset (misconfig), the probe
-        # succeeded but we have nowhere to send the caller — we must
-        # fall back to the ticket flow WITHOUT polluting Linear with a
-        # fake transfer ticket and WITHOUT blinding the abandoned-call
-        # wrapper.
-        target = os.environ.get("CONFERENCE_JOIN_NUMBER", "") if available else ""
-
-        if available and target:
-            # Real transfer: log first (the transfer kills our agent leg),
-            # mark complete (so the CallEnded wrapper doesn't double-log),
-            # announce, then transfer.
-            await log_call_complete(
-                call_id=call_id,
-                caller_number=caller_number,
-                caller_name=None,  # we don't ask before transferring
-                intent_summary=intent_summary,
-                outcome="transferred",
-                recap=(
-                    f"Caller was bridged to a human after escalation. "
-                    f"Intent: {intent_summary}"
-                ),
-            )
-            if completed_flag is not None:
-                completed_flag[0] = True
-            yield AgentSendText(
-                text="I'm connecting you to my human supervisor now.",
-                interruptible=False,
-            )
-            yield AgentTransferCall(target_phone_number=target)
-        else:
-            # Two cases land here:
-            #   (a) Probe failed (no one picked up within timeout)
-            #   (b) Probe succeeded but CONFERENCE_JOIN_NUMBER is unset
-            # Both fall through to the callback/email flow with the
-            # same spoken message. The LLM's record_followup +
-            # end_call_with_goodbye will produce the correct final
-            # Linear ticket — don't log anything here.
-            if available and not target:
-                logger.error(
-                    "Probe succeeded but CONFERENCE_JOIN_NUMBER unset — "
-                    "can't transfer. Falling through to ticket flow."
+        # Bridging mechanism: we use Twilio's REST API call.update
+        # (force-redirect) to move the customer's call into the
+        # conference, NOT Cartesia's AgentTransferCall. AgentTransferCall
+        # issues <Dial> from the customer's call leg, which Twilio's
+        # voice routing has been observed to reject with "busy" when
+        # the originating call came in on a toll-free number. The REST
+        # API mechanism doesn't place a new outbound call — it just
+        # rewrites the existing call's TwiML — so it's not subject to
+        # that restriction.
+        if available:
+            # No second speech here. The LLM's initial announcement
+            # ("Sure — one moment, connecting you to our team") already
+            # covered the "you're being transferred" signal. Adding a
+            # second "I'm connecting you to my human supervisor" right
+            # behind it made the bot sound like it was saying the same
+            # thing twice with no gap, which was confusing.
+            #
+            # We DO need to make sure the LLM's announcement has
+            # finished playing before we force-redirect — otherwise the
+            # call's TwiML switches mid-sentence and the customer hears
+            # the announcement get cut off.
+            #
+            # Estimate the announcement's spoken duration from word count
+            # (~0.4s per word) plus a small buffer. Caps at 8s so a
+            # pathologically long announcement doesn't make the customer
+            # wait forever. Beats the old hardcoded 4s which cut off
+            # longer announcements like "Yeah, that's account-specific
+            # so I'd want to get someone on our team..." (~5.5s spoken).
+            word_count = len(spoken_announcement.split())
+            announcement_budget = min(8.0, 0.4 * word_count + 0.5)
+            elapsed = time.monotonic() - announcement_start
+            remaining = announcement_budget - elapsed
+            if remaining > 0:
+                logger.info(
+                    "Waiting %.1fs for announcement (%d words) to finish before redirect",
+                    remaining,
+                    word_count,
                 )
+                await asyncio.sleep(remaining)
+
+            # Mark that primary attempted, so the delayed-backup task
+            # spawned by _wait_for_browser_pickup skips its own attempt.
+            if escalation_status is not None:
+                escalation_status["redirect_attempted"] = True
+
+            twilio_sid = _env("TWILIO_ACCOUNT_SID")
+            twilio_token = _env("TWILIO_AUTH_TOKEN")
+            client = Client(twilio_sid, twilio_token)
+            success = await _force_redirect_to_conference(
+                client, call_id, conf_name
+            )
+
+            if success:
+                if completed_flag is not None:
+                    completed_flag[0] = True
+                try:
+                    await log_call_complete(
+                        call_id=call_id,
+                        caller_number=caller_number,
+                        caller_name=None,
+                        intent_summary=intent_summary,
+                        outcome="transferred",
+                        recap=(
+                            f"Caller bridged to human via REST-API "
+                            f"force-redirect. Intent: {intent_summary}"
+                        ),
+                    )
+                except Exception as e:
+                    logger.warning("Linear log failed (non-fatal): %s", e)
+            else:
+                # Redirect failed (call already ended, Twilio outage,
+                # weird call state). Fall through to the callback-intake
+                # flow so the caller still has a path forward.
+                logger.warning(
+                    "Primary force-redirect failed — falling back to "
+                    "callback intake"
+                )
+                yield AgentSendText(
+                    text=TEAM_UNAVAILABLE_MESSAGE,
+                    interruptible=False,
+                )
+        else:
+            # Probe timed out — no one clicked the Slack button within
+            # PROBE_TIMEOUT_SECONDS. Standard callback-intake fallback.
             yield AgentSendText(
                 text=TEAM_UNAVAILABLE_MESSAGE,
                 interruptible=False,
@@ -391,14 +456,22 @@ def make_escalate_tool(
 
     `completed_flag` is the same single-element list shared with
     end_call_with_goodbye and the CallEnded wrapper in main.get_agent.
-    The transfer-success path here logs to Linear and then ends the call
-    via AgentTransferCall, which fires CallEnded — set the flag so the
-    wrapper doesn't double-log an "abandoned" ticket.
+    The transfer-success path here logs to Linear and then sets the
+    flag (Twilio REST API call.update moves the customer's call to the
+    conference, which causes Cartesia to see CallEnded shortly after) —
+    setting the flag prevents the wrapper from double-logging an
+    "abandoned" ticket.
 
-    `escalation_status` is an optional dict with key "in_progress",
-    shared with end_call_with_goodbye (for the Case 8 hijack-recovery
-    check) and main.py's wrapper (for the Case 9 no-op-on-duplicate
-    check).
+    `escalation_status` is an optional dict with keys:
+      - "in_progress": True while the escalation flow is running. Used
+        by end_call_with_goodbye (Case 8 recovery) and record_followup
+        (skip the callback flow if the LLM hijacks mid-wait) and by
+        main.py's wrapper (Case 9 no-op-on-duplicate check).
+      - "redirect_attempted": set True when the inline force-redirect
+        is about to fire. The delayed-backup task in
+        _wait_for_browser_pickup checks this before attempting its own
+        redirect, so the backup only kicks in when the inline path was
+        never reached (LLM-hijack scenario).
     """
 
     caller_number = call_request.from_ or "unknown"
@@ -427,17 +500,18 @@ def make_escalate_tool(
     ):
         """Reach out to the team for help with this caller. Handles
         everything end-to-end: speaks an announcement, pings the team via
-        Slack, runs the probe, and speaks the outcome to the caller.
+        Slack with a "Take call in browser" button, polls the conference
+        for a rep, and either bridges the caller in (force-redirect via
+        Twilio REST API) or speaks the lines-busy fallback.
 
-        After this tool finishes, the caller has been told either:
-          - The call is being transferred (and AgentTransferCall has fired)
-          - Our lines are busy + "what's your full name?" — leading the
-            caller into the callback intake flow
-
-        For the unavailable path, your next job is to collect the
-        caller's name and a callback number, then call record_followup.
-        The unavailable speech already asked for the name, so don't
-        re-ask — just take the response and proceed to the number.
+        After this tool finishes, the caller has either:
+          - Been moved into the conference with a human (call leg
+            redirected via REST API). The bot is out of the loop.
+          - Heard "Sorry, all our lines are busy — what's your full
+            name?" — your next job is to collect the caller's name and
+            callback number, then call record_followup. The unavailable
+            speech already asked for the name, so don't re-ask — just
+            take the response and proceed to the number.
         """
         # No-op if an escalation is already running (race with the Case
         # 9 wrapper trigger, or the LLM calling this tool twice in a
@@ -466,32 +540,27 @@ def make_escalate_tool(
 
 
 async def _wait_for_browser_pickup(
-    conf_name: str, call_id: str, completed_flag
+    conf_name: str,
+    call_id: str,
+    caller_number: str,
+    intent_summary: str,
+    completed_flag,
+    escalation_status,
 ) -> bool:
     """Browser-pickup mode: skip placing outbound cell calls and just
     wait for the Slack-button responder to join the conference via the
     Twilio Voice JS SDK.
 
-    The Slack ping was already sent with a "Take call in browser" button
-    by the time we get here. The responder clicks, lands on
-    /agent-pickup.html, clicks Join, and the browser SDK pulls them into
-    this conference. We detect the join via the same participant poll
-    used by the phone probe.
+    On success, also schedules a delayed-backup force-redirect task so
+    that an LLM-hijack-induced generator cancel (which would prevent the
+    inline force-redirect in run_escalation_flow from running) still
+    delivers the customer to the conference. The backup checks
+    escalation_status["redirect_attempted"] first — if the inline path
+    already tried (success or failure), the backup skips so we don't
+    yank the caller out of the callback-intake flow on a primary
+    failure.
 
-    On success, this also schedules a DELAYED force-redirect of the
-    customer's call to the conference via Twilio REST API. The delay
-    matters: the escalate_to_human generator yields a "connecting you to
-    my human supervisor" speech right after this returns True, and we
-    want that speech to actually play before the call is moved. The
-    delayed redirect checks completed_flag before firing — in the happy
-    path the speech yields and AgentTransferCall sets the flag, the
-    redirect skips itself. In the LLM-hijack path the flag stays False
-    and the redirect fires, guaranteeing the customer reaches the human
-    no matter what Cartesia's LLM did.
-
-    Returns True if someone joins within PROBE_TIMEOUT_SECONDS, False
-    otherwise (caller then falls through to callback intake, same as the
-    phone-probe miss path).
+    Returns True if someone joins within PROBE_TIMEOUT_SECONDS.
     """
     twilio_sid = _env("TWILIO_ACCOUNT_SID")
     twilio_token = _env("TWILIO_AUTH_TOKEN")
@@ -500,7 +569,17 @@ async def _wait_for_browser_pickup(
     if joined:
         redirect_task = asyncio.create_task(
             _delayed_force_redirect(
-                client, call_id, conf_name, completed_flag, delay_seconds=4
+                client,
+                call_id,
+                conf_name,
+                caller_number,
+                intent_summary,
+                completed_flag,
+                escalation_status,
+                # Give the inline primary in run_escalation_flow time to
+                # both speak the "connecting you" line (~3.5s) and fire
+                # the REST API redirect. Backup fires after that window.
+                delay_seconds=8,
             )
         )
         # Pin so an LLM-hijack-induced generator cancel doesn't kill it.
@@ -510,32 +589,69 @@ async def _wait_for_browser_pickup(
 
 
 async def _delayed_force_redirect(
-    client, call_id: str, conf_name: str, completed_flag, delay_seconds: float
+    client,
+    call_id: str,
+    conf_name: str,
+    caller_number: str,
+    intent_summary: str,
+    completed_flag,
+    escalation_status,
+    delay_seconds: float,
 ) -> None:
-    """Wait `delay_seconds`, then force the customer's call into the
-    conference via Twilio REST API — but only if the happy-path
-    AgentTransferCall didn't already do it (signaled via completed_flag).
+    """Belt-and-suspenders backup for the inline force-redirect in
+    run_escalation_flow. Only fires if the inline path was never
+    attempted (LLM-hijack scenario where the generator was cancelled
+    before reaching it).
     """
     await asyncio.sleep(delay_seconds)
-    if completed_flag is not None and completed_flag[0]:
+
+    if escalation_status is not None and escalation_status.get("redirect_attempted"):
         logger.info(
-            "Force-redirect skipped — AgentTransferCall already moved the call"
+            "Backup force-redirect skipped — primary already attempted"
         )
         return
-    await _force_redirect_to_conference(client, call_id, conf_name)
+    if completed_flag is not None and completed_flag[0]:
+        logger.info(
+            "Backup force-redirect skipped — call already completed"
+        )
+        return
+
+    success = await _force_redirect_to_conference(client, call_id, conf_name)
+    if not success:
+        return
+
+    try:
+        await log_call_complete(
+            call_id=call_id,
+            caller_number=caller_number,
+            caller_name=None,
+            intent_summary=intent_summary,
+            outcome="transferred",
+            recap=(
+                f"Caller bridged via backup force-redirect (LLM hijack "
+                f"path — inline primary never ran). Intent: {intent_summary}"
+            ),
+        )
+    except Exception as e:
+        logger.warning(
+            "Backup-redirect transferred-ticket log failed (non-fatal): %s", e
+        )
+    if completed_flag is not None:
+        completed_flag[0] = True
 
 
-async def _force_redirect_to_conference(client, call_id: str, conf_name: str) -> None:
+async def _force_redirect_to_conference(client, call_id: str, conf_name: str) -> bool:
     """Use Twilio's REST API to move the customer's call leg into the
-    conference, bypassing Cartesia. Best-effort: any failure logs and
-    moves on.
+    conference, bypassing Cartesia. Returns True on success, False
+    otherwise. The caller uses the result to decide whether to also
+    write the transferred-outcome Linear ticket.
     """
     functions_domain = os.environ.get("TWILIO_FUNCTIONS_DOMAIN", "").strip()
     if not functions_domain:
         logger.warning(
             "TWILIO_FUNCTIONS_DOMAIN unset — can't issue force-redirect"
         )
-        return
+        return False
 
     # call_id from CallRequest may or may not include Cartesia's "ac_"
     # prefix; Twilio's REST API needs the raw CallSid (CAxxxx...).
@@ -552,11 +668,13 @@ async def _force_redirect_to_conference(client, call_id: str, conf_name: str) ->
         logger.info(
             "Force-redirect: call=%s -> conf=%s", twilio_call_sid, conf_name
         )
+        return True
     except Exception as e:
         logger.warning(
             "Force-redirect failed (non-fatal, call may already be moved): %s",
             e,
         )
+        return False
 
 
 # === Real-mode probe (Twilio conference) ====================================
