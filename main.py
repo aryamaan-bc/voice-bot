@@ -909,6 +909,26 @@ async def get_agent(env: AgentEnv, call_request: CallRequest):
                     yield ev_out
                 return
 
+        # While the escalation flow is running, suppress LLM dispatch
+        # for user turns. The flow plays its own filler audio; letting
+        # the LLM also respond queues overlapping speech ("I'm
+        # connecting you to the team" right behind a filler with no
+        # pause). The system prompt instructs the LLM to stay silent
+        # during escalation, but Haiku is unreliable about it under
+        # drift — this is the code-level enforcement. Tools the LLM
+        # might call (escalate / record_followup / end_call) are
+        # already guarded by their own in_progress checks, so we don't
+        # lose any safety by skipping the LLM here.
+        if (
+            isinstance(event, UserTurnEnded)
+            and escalation_status["in_progress"]
+        ):
+            logger.info(
+                "Suppressing LLM dispatch (call=%s) — escalation in progress",
+                call_id,
+            )
+            return
+
         async for output in llm_agent.process(turn_env, event):
             yield output
 

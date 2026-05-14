@@ -74,7 +74,7 @@ _ACTIVE_PROBE_TASKS: set = set()
 # which can trigger the LLM mid-tool and break out of the escalate flow.
 # Keeping each gap to ~1s vs filler ~3s gives Cartesia almost no quiet
 # window to misinterpret as user input.
-PROBE_FILLER_INTERVAL_SECONDS = 4
+PROBE_FILLER_INTERVAL_SECONDS = 10
 # Wording deliberately avoids "one moment" / "one second" — those phrases
 # are already in the escalation announcements (e.g., "Sure — one moment,
 # connecting you to our team."), so echoing them in the first filler
