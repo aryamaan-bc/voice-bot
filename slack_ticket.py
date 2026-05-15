@@ -25,15 +25,15 @@ def make_followup_tool(call_request: CallRequest, escalation_status=None):
     """Build the record_followup tool bound to this call's CallRequest.
 
     `escalation_status` is an optional dict (shared with escalate_to_human
-    and end_call_with_goodbye). If escalation_status["in_progress"] is
-    True when the LLM calls this tool, the call is a NO-OP — we suppress
-    the Slack ticket and tell the LLM to stay on hold. This catches the
-    scenario where the caller speaks during the probe wait, the LLM
-    interprets their speech as a callback request, and tries to enter
-    callback intake even though the line isn't busy and a human is
-    about to join. After the probe times out (in_progress=False), this
-    tool resumes normal behavior so the legitimate callback flow still
-    works.
+    and end_call_with_goodbye). If escalation_status["phase"] is anything
+    other than "idle" when the LLM calls this tool, the call is a NO-OP
+    — we suppress the Slack ticket and tell the LLM to stay on hold.
+    This catches the scenario where the caller speaks during the probe
+    wait, the LLM interprets their speech as a callback request, and
+    tries to enter callback intake even though the line isn't busy and
+    a human is about to join. After the probe times out (phase reset to
+    "idle"), this tool resumes normal behavior so the legitimate
+    callback flow still works.
     """
 
     call_id = call_request.call_id
@@ -84,7 +84,7 @@ def make_followup_tool(call_request: CallRequest, escalation_status=None):
         # the caller's mid-wait speech. The line isn't actually busy and
         # a human might be about to join — refuse to enter callback
         # intake, no Slack ticket, tell the LLM to stay quiet.
-        if escalation_status is not None and escalation_status.get("in_progress"):
+        if escalation_status is not None and escalation_status.get("phase", "idle") != "idle":
             logger.warning(
                 "record_followup called while escalation in progress "
                 "(call_id=%s) — suppressing Slack ticket; LLM should "

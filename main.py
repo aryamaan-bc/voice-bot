@@ -64,12 +64,12 @@ def make_end_call_tool(
     The CallEnded wrapper in get_agent uses this to detect calls that
     ended cleanly vs callers who hung up mid-call.
 
-    `escalation_status` (dict with "in_progress") is checked at entry —
-    if an escalation is currently running and the LLM still chose to end
-    the call (Case 8: hijack-and-give-up), the tool replaces the LLM's
-    farewell with ESCALATION_RECOVERY_FAREWELL so the caller hears a
-    coherent message about the team following up rather than the LLM's
-    confused goodbye.
+    `escalation_status` (dict with "phase") is checked at entry — if an
+    escalation is currently running (phase != "idle") and the LLM still
+    chose to end the call (Case 8: hijack-and-give-up), the tool
+    replaces the LLM's farewell with ESCALATION_RECOVERY_FAREWELL so the
+    caller hears a coherent message about the team following up rather
+    than the LLM's confused goodbye.
     """
     call_id = call_request.call_id
     caller_number = call_request.from_ or "unknown"
@@ -123,7 +123,7 @@ def make_end_call_tool(
         # Override the farewell with a recovery message so the caller
         # gets a coherent close, and force-mark outcome=other so the
         # logged ticket doesn't claim the call was answered cleanly.
-        if escalation_status is not None and escalation_status.get("in_progress"):
+        if escalation_status is not None and escalation_status.get("phase", "idle") != "idle":
             logger.warning(
                 "end_call_with_goodbye called during active escalation "
                 "(call_id=%s) — using recovery farewell so the caller "
@@ -652,7 +652,7 @@ async def get_agent(env: AgentEnv, call_request: CallRequest):
     completed = [False]
 
     # Shared escalation state. set True when the escalation flow enters,
-    # cleared back to False when it exits. Used by:
+    # reset to "idle" when it exits. Used by:
     #   - escalate_to_human: skip duplicate runs (concurrent triggers).
     #   - end_call_with_goodbye: Case 8 recovery — detect that the LLM
     #     hijacked the tool and chose to end the call mid-escalation.
@@ -660,7 +660,9 @@ async def get_agent(env: AgentEnv, call_request: CallRequest):
     #     when the caller asked for a human and the LLM hasn't (yet)
     #     called escalate_to_human, then run the escalation flow
     #     ourselves so the caller's request never goes unanswered.
-    escalation_status = {"in_progress": False}
+    # v1 phase values: "idle" / "probe_wait". Queue work (slice 4+) adds
+    # "queue_wait" and "dispatched".
+    escalation_status = {"phase": "idle"}
 
     llm_agent = LlmAgent(
         model="anthropic/claude-haiku-4-5",
@@ -723,10 +725,10 @@ async def get_agent(env: AgentEnv, call_request: CallRequest):
         # here is the backstop: if the caller's transcript matches a
         # clear human-request pattern AND no escalation is already in
         # flight, bypass the LLM for this turn and run the escalation
-        # flow directly. The flow sets escalation_status["in_progress"]
-        # so the LLM's own escalate_to_human call (if it eventually
-        # fires) becomes a safe no-op.
-        if isinstance(event, UserTurnEnded) and not escalation_status["in_progress"]:
+        # flow directly. The flow flips escalation_status["phase"] off
+        # "idle" so the LLM's own escalate_to_human call (if it
+        # eventually fires) becomes a safe no-op.
+        if isinstance(event, UserTurnEnded) and escalation_status["phase"] == "idle":
             user_text = _extract_user_text(event)
             if user_text and user_wants_human(user_text):
                 logger.info(
@@ -762,11 +764,11 @@ async def get_agent(env: AgentEnv, call_request: CallRequest):
         # during escalation, but Haiku is unreliable about it under
         # drift — this is the code-level enforcement. Tools the LLM
         # might call (escalate / record_followup / end_call) are
-        # already guarded by their own in_progress checks, so we don't
+        # already guarded by their own phase checks, so we don't
         # lose any safety by skipping the LLM here.
         if (
             isinstance(event, UserTurnEnded)
-            and escalation_status["in_progress"]
+            and escalation_status["phase"] != "idle"
         ):
             logger.info(
                 "Suppressing LLM dispatch (call=%s) — escalation in progress",

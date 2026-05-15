@@ -215,9 +215,11 @@ async def run_escalation_flow(
     transfer the caller to the conference OR speak the "lines are busy"
     callback intake prompt.
 
-    `escalation_status` is an optional dict with key "in_progress". Set
-    True at entry, cleared False at exit so end_call_with_goodbye can
-    detect Case 8 (LLM hijack ending the call mid-escalation).
+    `escalation_status` is an optional dict with key "phase" (string).
+    Set to "probe_wait" at entry, reset to "idle" at exit so
+    end_call_with_goodbye can detect Case 8 (LLM hijack ending the call
+    mid-escalation). Future queue work introduces additional phase
+    values ("queue_wait", "dispatched"); v1 only uses "idle"/"probe_wait".
 
     `after_hours=True` short-circuits the probe: speak the announcement,
     fire a no-button Slack FYI ping + the pending Linear ticket, then go
@@ -226,7 +228,7 @@ async def run_escalation_flow(
     button. The LLM continues with name + number → record_followup.
     """
     if escalation_status is not None:
-        escalation_status["in_progress"] = True
+        escalation_status["phase"] = "probe_wait"
     try:
         logger.info(
             "escalation flow START call_id=%s intent=%r",
@@ -483,12 +485,12 @@ async def run_escalation_flow(
                 interruptible=False,
             )
     finally:
-        # Always clear in_progress, even if the generator is cancelled
+        # Always reset phase to "idle", even if the generator is cancelled
         # mid-flow by an LLM hijack. This way end_call_with_goodbye
         # firing after a hijack-and-give-up correctly sees "not in
         # escalation anymore" and ends normally.
         if escalation_status is not None:
-            escalation_status["in_progress"] = False
+            escalation_status["phase"] = "idle"
 
 
 def make_escalate_tool(
@@ -508,10 +510,12 @@ def make_escalate_tool(
     "abandoned" ticket.
 
     `escalation_status` is an optional dict with keys:
-      - "in_progress": True while the escalation flow is running. Used
-        by end_call_with_goodbye (Case 8 recovery) and record_followup
-        (skip the callback flow if the LLM hijacks mid-wait) and by
-        main.py's wrapper (Case 9 no-op-on-duplicate check).
+      - "phase": string state, one of "idle" / "probe_wait" (queue work
+        adds "queue_wait" and "dispatched" later). Non-"idle" means an
+        escalation is active. Used by end_call_with_goodbye (Case 8
+        recovery) and record_followup (skip the callback flow if the
+        LLM hijacks mid-wait) and by main.py's wrapper (Case 9
+        no-op-on-duplicate check).
       - "redirect_attempted": set True when the inline force-redirect
         is about to fire. The delayed-backup task in
         _wait_for_browser_pickup checks this before attempting its own
@@ -565,7 +569,7 @@ def make_escalate_tool(
         # No-op if an escalation is already running (race with the Case
         # 9 wrapper trigger, or the LLM calling this tool twice in a
         # row). The active one continues; this call returns immediately.
-        if escalation_status is not None and escalation_status.get("in_progress"):
+        if escalation_status is not None and escalation_status.get("phase", "idle") != "idle":
             logger.info(
                 "escalate_to_human called but escalation already in progress — "
                 "skipping duplicate"
