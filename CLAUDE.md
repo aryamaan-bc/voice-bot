@@ -67,20 +67,29 @@ always live, feeding STT into the LLM. There is no Line-SDK API to mute
 user audio during a passthrough tool. If the customer speaks during the
 silent gap between filler-audio lines, the LLM can be invoked and
 "hijack" the in-progress escalate_to_human tool — generating a
-conversational response that derails the escalation. Three layered
+conversational response that derails the escalation. Four layered
 defenses, all in [escalation.py](escalation.py) + [main.py](main.py):
 
-1. **Tight filler audio** ([escalation.py](escalation.py)). `PROBE_FILLER_INTERVAL_SECONDS = 4`,
-   14 filler lines, each ~3s spoken. Net silent window between fillers is
-   ~1s — much harder for the user's speech to slip into the LLM. Was 10s
-   before; the change cut hijack frequency dramatically. Don't widen the
-   interval without adding more fillers.
-2. **Pinned probe task** (`_ACTIVE_PROBE_TASKS`). The probe runs as an
+1. **LLM dispatch suppression during escalation** ([main.py](main.py)).
+   The `agent_with_abandoned_logging` wrapper checks
+   `escalation_status["in_progress"]` on each `UserTurnEnded` event and
+   refuses to forward the turn to the LLM while an escalation is active.
+   With the LLM unreachable, user mic input during a filler gap can't
+   trigger a hijack at all. Added in commit d5410ff and currently the
+   primary defense — the other three below are belt-and-suspenders.
+2. **Filler audio** ([escalation.py](escalation.py)).
+   `PROBE_FILLER_INTERVAL_SECONDS = 10`, 14 lines in `PROBE_FILLERS`,
+   each ~3s spoken. The interval was previously 4s when filler density
+   was the only defense against hijacks; once dispatch suppression
+   landed, the interval was widened to 10s for less-frantic pacing. If
+   suppression in defense #1 ever has to be weakened, drop the interval
+   back to 4s to restore the old filler-density defense.
+3. **Pinned probe task** (`_ACTIVE_PROBE_TASKS`). The probe runs as an
    asyncio task. If the LLM hijacks and Cartesia cancels the generator,
    the spawned task would normally be cancelled too. Storing it in a
    module-level set pins it until completion — so participant detection
    and the force-redirect still fire even after a hijack.
-3. **Force-redirect via Twilio REST API** (`_force_redirect_to_conference`).
+4. **Force-redirect via Twilio REST API** (`_force_redirect_to_conference`).
    When a human joins the conference, the probe task does TWO things:
    (a) returns True so the happy-path `AgentTransferCall` yield fires;
    (b) schedules a delayed (4s) REST API call to move the customer's call
@@ -104,6 +113,39 @@ If you change anything in this area: think through ALL 9 cases. The system
 is designed so that **a caller asking for a human cannot end the call
 without the team being notified** (`log_escalation_started` is the floor).
 Don't introduce a code path that breaks that guarantee.
+
+## Queue (Cases 10-12) — coming in the queue-v1 rollout
+
+When `QUEUE_ENABLED=true` (gated behind a feature flag during burn-in), a
+new `queue_wait` phase sits between "FAQ" and "transferred". Customers who
+escalate while both reps are busy hold in a silent-hold queue with
+position updates instead of dropping straight to callback intake. The
+implementation lives in `queue.py` (new module, slice 3) + a `phase` field
+on `escalation_status` replacing the existing boolean `in_progress` (slice
+2). Plan file: `~/.claude/plans/crystalline-sleeping-aho.md`.
+
+The three new invariants to preserve when working on queue code:
+
+- **Case 10: Hangup during queue wait** — the `CallEnded` handler must
+  call `queue.dequeue(call_id)` AND log `outcome="abandoned_in_queue"`
+  (not generic `abandoned`). Without the dequeue, a phantom entry blocks
+  subsequent customers' position advancement.
+
+- **Case 11: Queue hard-timeout** — when `MAX_QUEUE_WAIT_SECONDS` elapses
+  without a slot freeing, the customer must drop into the standard
+  callback-intake flow (`TEAM_UNAVAILABLE_MESSAGE` → `record_followup` →
+  `outcome="callback_logged"`), NOT a silent hangup. Same "no caller
+  asking for a human can end the call without the team being notified"
+  guarantee as the Cases 1-9 invariant.
+
+- **Case 12: Dispatch race** — two customers seeing `slot_free=True`
+  simultaneously must not both self-promote to `probe_wait`. The
+  `_ACTIVE_PROBES` counter incremented/decremented under `_QUEUE_LOCK` is
+  the only correct guard. Don't poll Twilio independently from each
+  customer's coroutine; one shared poller per process is the design.
+
+While the feature flag is off (default), none of this code is reachable —
+`escalate_to_human` runs the existing probe-or-callback path verbatim.
 
 ## The atomic-tool rule (the #1 bug source)
 

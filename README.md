@@ -173,7 +173,7 @@ cartesia logs --follow
 
    Once running, the flow:
    - Speaks the announcement, fires the Slack ping with a "Take call in browser" button, immediately writes an `escalation_pending` Linear ticket so the team has a paper trail no matter what happens next, then polls the per-call Twilio conference for a human to join.
-   - Plays filler audio every ~4 seconds during the wait (tight cadence keeps Cartesia's STT from picking up unrelated caller speech and triggering an LLM hijack).
+   - Plays filler audio every ~10 seconds during the wait. (LLM dispatch is suppressed for the duration of the escalation — see CLAUDE.md "LLM-hijack recovery" — so the filler cadence is about caller comfort rather than hijack resistance.)
    - **Available** (human joined): log Linear ticket (`outcome=transferred`), speak "I'm connecting you to my human supervisor now," yield `AgentTransferCall` → caller bridges into the conference. A parallel **force-redirect** also fires via Twilio REST API as a belt-and-suspenders mechanism — if the LLM hijacked the tool mid-wait and the `AgentTransferCall` yield got dropped, the REST redirect still moves the caller into the conference.
    - **Unavailable** (60s timeout, nobody clicked): the bot leads the caller straight into callback intake (name + phone), `record_followup` logs to Slack, `end_call_with_goodbye` wraps with `outcome=callback_logged`.
    - **LLM hijack + tries to end the call** (Case 8): `end_call_with_goodbye` detects active escalation, replaces the LLM's farewell with a recovery message ("Sorry about that — our team has the request and someone will follow up shortly"), still logs the ticket.
@@ -182,6 +182,10 @@ cartesia logs --follow
 6. **Caller hangs up mid-call** — `CallEnded` wrapper logs `outcome=abandoned` so it still shows up in Linear/Slack.
 7. **Asked "what's your name?"** — bot says it's "the customer support agent for Basic Capital" (no first name).
 8. **Asked "are you a bot?"** — bot confirms truthfully ("AI customer support agent for Basic Capital") and offers to keep helping or transfer. Only escalates if the caller actually picks the human path. The pattern matcher deliberately does NOT match this question (it's a question, not a request — see CLAUDE.md).
+
+### Queue (when reps are all busy)
+
+When `QUEUE_ENABLED=true` and the active-conference count reaches `MAX_CONCURRENT_REPS`, a new escalation lands in a FIFO queue instead of running the 60s probe. The customer hears their position and waits in silent hold; the bot dispatches them when a rep frees up, or falls through to callback intake after `MAX_QUEUE_WAIT_SECONDS`. See CLAUDE.md "Queue (Cases 10-12)" for failure-mode handling. Disabled by default until queue code lands.
 
 ### Outside business hours
 
