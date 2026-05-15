@@ -212,9 +212,9 @@ async def _wait_in_queue(
 
     yield AgentSendText(
         text=(
-            f"All our reps are with customers right now. You're #{position} "
-            f"in line — hang tight, we'll connect you as soon as someone "
-            f"frees up."
+            f"All our reps are with customers right now. You're number "
+            f"{position} in line — hang tight, we'll connect you as soon "
+            f"as someone frees up."
         ),
         interruptible=False,
     )
@@ -274,7 +274,7 @@ async def _wait_in_queue(
             new_pos = await hold_queue.position(call_id)
             if new_pos is not None:
                 yield AgentSendText(
-                    text=f"Still here with you — you're #{new_pos} in line.",
+                    text=f"Still here with you — you're number {new_pos} in line.",
                     interruptible=False,
                 )
             continue
@@ -465,12 +465,33 @@ async def run_escalation_flow(
         announcement_start = time.monotonic()
         yield AgentSendText(text=announced_text, interruptible=False)
 
-        # Step 2 — fire the team Slack ping. AWAITED so it can't be
-        # silently dropped (this was a bug previously when it was
-        # fire-and-forget).
+        # Direct-admit probe wait: tell the caller their position so
+        # every escalation has a position-aware framing (unified UX with
+        # the queue-wait path). Without this they'd hear only filler
+        # audio for up to 60s with no context. Skip on:
+        #   - queued_then_dispatched: caller just heard "Got a rep for
+        #     you now — one moment"; adding "#1 in line" would be weird.
+        #   - after_hours: no live transfer happening; goes straight to
+        #     callback intake.
+        #   - demo_mode: demo path sleeps 5s and returns unavailable.
+        # The phrasing "number 1 in line" matches the queue path's
+        # spelled-out form for TTS (avoid "#" which TTS reads as
+        # "pound"/"hash"; see CLAUDE.md "Spoken vs written forms").
         demo_mode = (
             os.environ.get("DEMO_MODE", "").strip().lower() in ("1", "true", "yes")
         )
+        if not queued_then_dispatched and not after_hours and not demo_mode:
+            yield AgentSendText(
+                text=(
+                    "You're number 1 in line — hang tight while I get "
+                    "someone for you."
+                ),
+                interruptible=False,
+            )
+
+        # Step 2 — fire the team Slack ping. AWAITED so it can't be
+        # silently dropped (this was a bug previously when it was
+        # fire-and-forget).
         browser_pickup = (
             os.environ.get("BROWSER_PICKUP", "").strip().lower()
             in ("1", "true", "yes")
