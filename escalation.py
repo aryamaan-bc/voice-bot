@@ -633,7 +633,20 @@ async def run_escalation_flow(
             # announcements don't strand the customer in silence and
             # long ones aren't cut off mid-sentence.
             word_count = len(announced_text.split())
-            announcement_budget = min(8.0, 0.4 * word_count + 0.5)
+            if queued_then_dispatched:
+                # Larger budget: when dispatched from queue, the LLM
+                # may have been mid-FAQ-answer when the transition
+                # message fired (queue_wait allows conversational
+                # hold). The transition message queues behind the
+                # in-flight LLM speech in Cartesia's TTS buffer. Give
+                # Cartesia time to drain that buffer + play the
+                # transition + leave a beat before the force-redirect
+                # cuts audio. Crude but cheap; the alternative is to
+                # actively cancel in-flight LLM speech which the Line
+                # SDK doesn't cleanly expose.
+                announcement_budget = 12.0
+            else:
+                announcement_budget = min(8.0, 0.4 * word_count + 0.5)
             elapsed = time.monotonic() - announcement_start
             remaining = announcement_budget - elapsed
             if remaining > 0:

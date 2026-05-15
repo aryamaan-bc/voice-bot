@@ -18,6 +18,8 @@ import httpx
 from line.llm_agent.tools.decorators import loopback_tool
 from line.voice_agent_app import CallRequest
 
+import hold_queue
+
 logger = logging.getLogger(__name__)
 
 
@@ -25,15 +27,14 @@ def make_followup_tool(call_request: CallRequest, escalation_status=None):
     """Build the record_followup tool bound to this call's CallRequest.
 
     `escalation_status` is an optional dict (shared with escalate_to_human
-    and end_call_with_goodbye). If escalation_status["phase"] is anything
-    other than "idle" when the LLM calls this tool, the call is a NO-OP
-    — we suppress the Slack ticket and tell the LLM to stay on hold.
-    This catches the scenario where the caller speaks during the probe
-    wait, the LLM interprets their speech as a callback request, and
-    tries to enter callback intake even though the line isn't busy and
-    a human is about to join. After the probe times out (phase reset to
-    "idle"), this tool resumes normal behavior so the legitimate
-    callback flow still works.
+    and end_call_with_goodbye). Behavior depends on the current `phase`:
+      - "probe_wait": refuse — line isn't actually busy yet and a human
+        might be about to join. Return a "stay on the line" string for
+        the LLM to speak.
+      - "queue_wait": treat as voluntary opt-out from the queue. Dequeue
+        the caller (so the next person advances) + reset phase to "idle"
+        + fall through to normal callback intake.
+      - "idle": normal callback intake.
     """
 
     call_id = call_request.call_id
@@ -79,14 +80,14 @@ def make_followup_tool(call_request: CallRequest, escalation_status=None):
         wording to use when confirming to the caller — or an email
         fallback if Slack is unreachable.
         """
-        # If escalation is still in progress (probe waiting for a human
-        # to join), this tool fires only because the LLM hijacked from
-        # the caller's mid-wait speech. The line isn't actually busy and
-        # a human might be about to join — refuse to enter callback
-        # intake, no Slack ticket, tell the LLM to stay quiet.
-        if escalation_status is not None and escalation_status.get("phase", "idle") != "idle":
+        # During the probe wait, this tool fires only because the LLM
+        # hijacked from the caller's mid-wait speech. The line isn't
+        # actually busy and a human might be about to join — refuse to
+        # enter callback intake, no Slack ticket, tell the LLM to stay
+        # quiet.
+        if escalation_status is not None and escalation_status.get("phase", "idle") == "probe_wait":
             logger.warning(
-                "record_followup called while escalation in progress "
+                "record_followup called during probe_wait "
                 "(call_id=%s) — suppressing Slack ticket; LLM should "
                 "return to silent hold mode",
                 call_id,
@@ -94,6 +95,22 @@ def make_followup_tool(call_request: CallRequest, escalation_status=None):
             return (
                 "Hold on — our team is still reaching out. "
                 "Stay on the line."
+            )
+
+        # During the queue wait, the caller is voluntarily opting out
+        # of waiting for a rep ("just take my info instead"). Dequeue
+        # them so the next person in line advances, and reset phase to
+        # "idle" so downstream tools (end_call_with_goodbye, CallEnded)
+        # treat this as a clean callback-intake completion rather than
+        # an in-progress escalation.
+        if escalation_status is not None and escalation_status.get("phase", "idle") == "queue_wait":
+            await hold_queue.dequeue(call_id)
+            escalation_status["phase"] = "idle"
+            logger.info(
+                "record_followup called during queue_wait "
+                "(call_id=%s) — dequeued; phase reset to idle. "
+                "Proceeding with normal callback intake.",
+                call_id,
             )
 
         webhook_url = os.environ.get("SLACK_WEBHOOK_URL")

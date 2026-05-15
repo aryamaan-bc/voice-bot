@@ -120,13 +120,21 @@ def make_end_call_tool(
         """Wrap up the call: log a Linear ticket + Slack summary for the
         ops team, speak the farewell, and end the call. Use this for ALL
         call wrap-ups — it's the only way to end a call cleanly."""
-        # Case 8 — LLM hijack during escalation chose end_call_with_goodbye.
-        # Override the farewell with a recovery message so the caller
-        # gets a coherent close, and force-mark outcome=other so the
-        # logged ticket doesn't claim the call was answered cleanly.
-        if escalation_status is not None and escalation_status.get("phase", "idle") != "idle":
+        # Case 8 / queue refusal — phase-aware behavior when the LLM
+        # tries to end the call mid-escalation.
+        current_phase = (
+            escalation_status.get("phase", "idle")
+            if escalation_status is not None
+            else "idle"
+        )
+        if current_phase == "probe_wait":
+            # Case 8: LLM hijack during the probe wait chose
+            # end_call_with_goodbye. Override the farewell with a
+            # recovery message so the caller gets a coherent close, and
+            # force-mark outcome=other so the logged ticket doesn't
+            # claim the call was answered cleanly.
             logger.warning(
-                "end_call_with_goodbye called during active escalation "
+                "end_call_with_goodbye called during probe_wait "
                 "(call_id=%s) — using recovery farewell so the caller "
                 "doesn't hear a confused goodbye while team follow-up "
                 "is pending",
@@ -135,12 +143,25 @@ def make_end_call_tool(
             farewell = ESCALATION_RECOVERY_FAREWELL
             outcome = "other"
             recap = (
-                "Escalation was in progress when end_call_with_goodbye "
+                "Probe wait was in progress when end_call_with_goodbye "
                 "fired (LLM hijack mid-tool). The caller heard the "
                 "recovery farewell; the escalation_pending ticket from "
                 "earlier in the call is the source of truth for the "
                 "team follow-up. Original LLM-supplied recap: " + recap
             )
+        elif current_phase == "queue_wait":
+            # The caller is in the hold queue. They explicitly asked
+            # for a human; we're holding their place in line. The LLM
+            # has no business ending the call here — the system prompt
+            # forbids it, but if it tries anyway, refuse silently. The
+            # queue position-update cadence continues; dispatch will
+            # fire when their turn comes.
+            logger.warning(
+                "end_call_with_goodbye called during queue_wait "
+                "(call_id=%s) — refusing; caller stays in queue",
+                call_id,
+            )
+            return
 
         # Log first (fast — Slack <300ms, Linear <500ms typically) so the
         # ticket is created even if the speech/hangup somehow fails.
@@ -379,30 +400,59 @@ our team."
 - Off-FAQ: "Hmm, that's not something I can answer myself, but our team \
 can — let me try them. Hang on one moment."
 
-# ⚠️ DURING escalate_to_human — STAY SILENT
-While escalate_to_human is running (the probe is polling for a human \
-to join — could take up to 60 seconds), the caller may speak. They \
-might get impatient, ask "are you there?", start describing their \
-issue again, or even say something that sounds like they want a \
-callback. **Ignore all of it. Do not respond. Do not call any other \
-tool — not record_followup, not anything.** The escalation tool plays \
-its own filler audio during the wait ("yep, still here", "bear with \
-me", etc.). Your turn comes only AFTER the tool finishes with one of \
-the two outcomes below.
+# ⚠️ DURING escalate_to_human — phase-dependent behavior
+After you call escalate_to_human, the bot speaks one of two things:
 
-If you call record_followup while escalation is in progress, the tool \
-will refuse (the line isn't actually busy yet) and return "Hold on — \
-our team is still reaching out. Stay on the line." — but don't get \
-there in the first place; just stay quiet during the wait.
+(P) **Probe wait** — the bot says something like "Yep, still here — \
+reaching out to our team now" / "Bear with me — almost there" / "Hang \
+tight, getting someone on the line." These are filler audio lines \
+during a ~60-second probe waiting for a human to click the Slack \
+button. **STAY SILENT.** If the caller speaks, ignore it completely. \
+Do not respond. Do not call any other tool — not record_followup, not \
+anything. Your turn comes only after the probe completes.
 
-After escalate_to_human runs, the caller will have heard ONE of:
-A. "Connecting you now" — and the call is being transferred. The tool \
-has already fired the transfer. You are DONE. Don't say or do anything \
-else.
-B. "Sorry, all our lines are busy right now. Let me grab your name and \
-a callback number so someone can follow up on the next business day — \
-what's your full name?" — wait for the caller's reply, then proceed \
-with the callback flow below.
+(Q) **Queue wait** — the bot says "All our reps are with customers \
+right now. You're #N in line — hang tight, we'll connect you as soon \
+as someone frees up." The caller is now in the hold queue. Periodically \
+the bot speaks position updates ("Still here with you — you're #1 in \
+line"). The wait can be several minutes.
+
+During queue wait you DO get user turns and CAN respond. The rules:
+
+- Caller asks a FAQ question → answer it briefly (1-2 sentences, same \
+as normal FAQ chat). Don't promise transfer timing — the wait could \
+still be several minutes.
+- Caller says they'd rather just leave their info ("just take a \
+message", "have them call me back", "I don't want to wait") → call \
+record_followup. The tool dequeues them from the queue and runs the \
+standard callback intake flow.
+- Caller asks "are you still there?" or similar reassurance → brief \
+"Yes, still here with you — you're in line and we'll connect as soon \
+as we can." Don't promise a specific time.
+- **Do NOT call escalate_to_human again.** The caller is already in \
+the queue; another call is a no-op.
+- **Do NOT call end_call_with_goodbye while they're queued.** The \
+caller explicitly asked for a human and is waiting for one — ending \
+the call would skip their handoff. The tool will refuse if you try, \
+but don't try.
+- **Avoid phrases that imply imminent transfer** like "connecting you \
+now" or "any second now" — they're still waiting and that wording \
+would be misleading. When their turn finally comes, the bot speaks \
+its own dispatch line ("Got a rep for you now — one moment") and \
+runs the probe.
+
+If you call record_followup during probe wait (P), the tool refuses \
+and returns "Hold on — our team is still reaching out. Stay on the \
+line." — but stay silent in the first place during probe wait.
+
+After escalate_to_human finishes, the caller will have heard ONE of:
+A. "Connecting you now" / "Got a rep for you now" — the call is being \
+transferred. The tool fired the transfer. You are DONE.
+B. "Sorry, all our lines are busy right now. Let me grab your name \
+and a callback number..." (probe failed) OR "Thanks for holding — \
+sorry the wait's running long. Let me grab your name and a callback \
+number..." (queue hard-timeout). Either way, wait for the caller's \
+reply, then proceed with the callback flow below.
 
 # After the unavailable speech — callback flow only
 
@@ -788,22 +838,25 @@ async def get_agent(env: AgentEnv, call_request: CallRequest):
                     yield ev_out
                 return
 
-        # While the escalation flow is running, suppress LLM dispatch
-        # for user turns. The flow plays its own filler audio; letting
-        # the LLM also respond queues overlapping speech ("I'm
-        # connecting you to the team" right behind a filler with no
-        # pause). The system prompt instructs the LLM to stay silent
-        # during escalation, but Haiku is unreliable about it under
-        # drift — this is the code-level enforcement. Tools the LLM
-        # might call (escalate / record_followup / end_call) are
-        # already guarded by their own phase checks, so we don't
-        # lose any safety by skipping the LLM here.
+        # During the probe wait, suppress LLM dispatch for user turns.
+        # The flow plays its own filler audio every ~10s; letting the
+        # LLM also respond queues overlapping speech ("I'm connecting
+        # you to the team" right behind a filler with no pause). The
+        # system prompt instructs the LLM to stay silent, but Haiku
+        # is unreliable about it under drift — this is the code-level
+        # enforcement. Tools the LLM might call are guarded by their
+        # own phase checks too.
+        #
+        # During queue_wait we DO NOT suppress: the bot is mostly
+        # quiet (one position update per ~45s), so the LLM is free to
+        # answer FAQ questions or route the caller into record_followup
+        # if they ask to opt out of the queue.
         if (
             isinstance(event, UserTurnEnded)
-            and escalation_status["phase"] != "idle"
+            and escalation_status["phase"] == "probe_wait"
         ):
             logger.info(
-                "Suppressing LLM dispatch (call=%s) — escalation in progress",
+                "Suppressing LLM dispatch (call=%s) — probe wait in progress",
                 call_id,
             )
             return
