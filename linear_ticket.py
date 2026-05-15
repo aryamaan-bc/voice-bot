@@ -39,6 +39,8 @@ Outcome = Literal[
     "voicemail",
     "abandoned",
     "escalation_pending",
+    "queue_waiting",
+    "abandoned_in_queue",
     "other",
 ]
 
@@ -51,6 +53,8 @@ _OUTCOME_LABELS = {
     "voicemail": "Voicemail captured (after hours)",
     "abandoned": "Caller hung up mid-call",
     "escalation_pending": "Escalation started — outcome pending",
+    "queue_waiting": "Queued — waiting for a rep",
+    "abandoned_in_queue": "Caller hung up while queued",
     "other": "Other",
 }
 
