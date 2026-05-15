@@ -10,14 +10,15 @@ behavior, gotchas, and rules that aren't obvious from the code.
   via the Twilio integration (see "Toll-free import flow" below). Cartesia
   handles the Twilio webhook wiring — do NOT set the toll-free's voice URL
   by hand.
-- **Entry point**: `get_agent` in [main.py](main.py) returns either:
-  - **Closed-hours voicemail agent** — LLM-driven, single tool (`end_voicemail`),
-    strict one-turn capture flow with a force-end safety net.
-  - **Main FAQ agent** — full `LlmAgent` with three tools, wrapped in
-    `agent_with_abandoned_logging` which handles BOTH the `CallEnded`
-    abandoned-ticket fallback AND the **Case 9 pre-LLM bypass**: if the user
-    transcript matches `user_wants_human()` and no escalation is in progress,
-    the wrapper runs the escalation flow directly without invoking the LLM.
+- **Entry point**: `get_agent` in [main.py](main.py) always returns the
+  **Main FAQ agent** — full `LlmAgent` with three tools, wrapped in
+  `agent_with_abandoned_logging` which handles BOTH the `CallEnded`
+  abandoned-ticket fallback AND the **Case 9 pre-LLM bypass**: if the user
+  transcript matches `user_wants_human()` and no escalation is in progress,
+  the wrapper runs the escalation flow directly without invoking the LLM.
+  Outside business hours, the greeting + a small prompt note are swapped in
+  and `after_hours=True` is threaded through to `escalate_to_human` — the
+  FAQ flow itself is unchanged.
 - **Per-call shared state** (lives in `get_agent`, passed to tool factories):
   - `completed = [False]` — set True when any clean termination fires (used
     by `CallEnded` to skip the duplicate abandoned ticket).
@@ -40,10 +41,6 @@ behavior, gotchas, and rules that aren't obvious from the code.
      `escalation_status["in_progress"]` at entry; if active, replaces the
      LLM's farewell with `ESCALATION_RECOVERY_FAREWELL` (Case 8). Logs to
      Linear + Slack, speaks farewell, hangs up.
-- **One tool for the voicemail agent**:
-  - `end_voicemail` ([main.py](main.py)) — same shape as
-    `end_call_with_goodbye` but with three params (`farewell`, `caller_name`,
-    `message_summary`) instead of five; hardcodes `outcome="voicemail"`.
 - **Per-call ticketing**: `log_call_complete` in
   [linear_ticket.py](linear_ticket.py) is the unified entry for outcome
   tickets. `log_escalation_started` fires the moment an escalation begins
@@ -110,10 +107,9 @@ Don't introduce a code path that breaks that guarantee.
 
 ## The atomic-tool rule (the #1 bug source)
 
-Three tools speak directly to the caller: `escalate_to_human`,
-`end_call_with_goodbye`, and `end_voicemail`. When the LLM calls any of them,
-it MUST NOT generate any text in the same turn — the tool produces all the
-speech.
+Two tools speak directly to the caller: `escalate_to_human` and
+`end_call_with_goodbye`. When the LLM calls either, it MUST NOT generate
+any text in the same turn — the tool produces all the speech.
 
 If the LLM emits text alongside the tool call, the caller hears two
 back-to-back messages and it sounds broken. The rule appears multiple times
@@ -136,13 +132,17 @@ adjusting the system prompt's tool-call examples: spoken text fields
 
 ## AI disclosure policy (REACTIVE, not proactive)
 
-- **Greeting**: does NOT mention "AI", "bot", or "automated". Alex introduces
-  by name only.
-- **If the caller asks** ("are you a bot?", "is this AI?"): Alex MUST be
-  truthful and confirm. Identify specifically as
-  **"AI customer support specialist for Basic Capital"** (NOT "voice
-  assistant" — user corrected this). Then offer to keep helping OR transfer
-  to a human. Only escalate if the caller actually picks the human path.
+- **Greeting**: does NOT mention "AI", "bot", or "automated". The bot is
+  **nameless** — the greeting introduces "Basic Capital" only, no first
+  name. (Earlier versions used "Alex"; removed at Will's request.)
+- **If the caller asks for a name** ("what's your name?", "who am I
+  talking to?"): the bot says something like "I'm the customer support
+  agent for Basic Capital" — neutral, no first name.
+- **If the caller asks if it's a bot/AI** ("are you a bot?", "is this
+  AI?"): the bot MUST be truthful. Identify specifically as
+  **"AI customer support agent for Basic Capital"**. Then offer to keep
+  helping OR transfer to a human. Only escalate if the caller actually
+  picks the human path.
 
 This was reversed from an earlier policy on 2026-05-01. If you're tempted to
 "clean up" the Bot Identity section by routing AI-questions back to
@@ -157,19 +157,26 @@ The bot must just say "One moment." and trigger the probe immediately. The
 faster the bot gets out of the way, the better. Don't soften this rule —
 empathy on top of agitation makes callers angrier.
 
-## Voicemail flow is strict
+## Business hours and after-hours behavior
 
-After-hours calls go to a separate LLM agent with a strict one-turn capture
-flow:
-- Greeting → caller speaks one message → bot calls `end_voicemail`. Done.
-- NO acknowledgements, NO follow-up questions, NO "anything else?"
-- Edge cases (caller asks a question, wants a human, transfers requested) are
-  all framed as "that IS the message — capture it and end."
-- A wrapper in `make_closed_hours_agent` force-ends the call if the caller
-  speaks a second time, to prevent LLM drift into chatty mode.
+Business hours: **Mon–Fri, 9 AM – 5 PM Eastern**. Outside that window, the
+FAQ agent still runs in full — callers can ask any FAQ question. The only
+differences after-hours:
 
-If you're tempted to make the voicemail agent more conversational, don't —
-the user explicitly chose strict mode (2026-05-11). One message, then end.
+- Greeting swaps to `AFTER_HOURS_GREETING` ("we're outside business hours…
+  I can still answer general questions or take a message").
+- A short `AFTER_HOURS_PROMPT_NOTE` is appended to the system prompt so the
+  LLM knows live transfers aren't possible and avoids "connecting you now"
+  phrasing.
+- `escalate_to_human` runs with `after_hours=True`: skips the probe wait
+  entirely (no one's online to click the Slack button), sends an FYI-only
+  Slack ping (no button), and goes straight to `AFTER_HOURS_UNAVAILABLE_MESSAGE`
+  which leads into the standard callback intake flow.
+
+Earlier the after-hours path was a strict one-shot voicemail agent. That
+was replaced 2026-05-15 — callers wanted FAQs answered 24/7 and the
+voicemail flow was discarded. Don't reintroduce a separate closed-hours
+agent unless explicitly asked.
 
 ## IRS rules vs BC operational capability
 
@@ -287,7 +294,7 @@ Key resource IDs (stored only here for reference, not in code):
 
 The 218 area code number Cartesia provisioned originally is still
 assigned to the agent as a parked backup. Either number routes inbound
-calls to Alex. Release the 218 once toll-free has run a week of clean
+calls to the bot. Release the 218 once toll-free has run a week of clean
 traffic.
 
 ## Twilio API Key auth bug (workaround)

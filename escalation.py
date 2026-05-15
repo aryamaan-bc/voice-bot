@@ -107,6 +107,15 @@ TEAM_UNAVAILABLE_MESSAGE = (
     "next business day — what's your full name?"
 )
 
+# Spoken when an after-hours caller explicitly asks for a human. No
+# probe runs — the team isn't online to pick up — so we go straight to
+# callback intake. Phrasing avoids "lines are busy" (misleading;
+# they're closed, not busy).
+AFTER_HOURS_UNAVAILABLE_MESSAGE = (
+    "Let me grab your name and a callback number so someone can "
+    "follow up on the next business day — what's your full name?"
+)
+
 
 def _env(name: str, *, required: bool = True) -> str:
     val = os.environ.get(name, "")
@@ -192,6 +201,7 @@ async def run_escalation_flow(
     intent_summary: str,
     completed_flag=None,
     escalation_status=None,
+    after_hours: bool = False,
 ):
     """The escalation flow body. Yields agent events. Called from two
     places:
@@ -208,6 +218,12 @@ async def run_escalation_flow(
     `escalation_status` is an optional dict with key "in_progress". Set
     True at entry, cleared False at exit so end_call_with_goodbye can
     detect Case 8 (LLM hijack ending the call mid-escalation).
+
+    `after_hours=True` short-circuits the probe: speak the announcement,
+    fire a no-button Slack FYI ping + the pending Linear ticket, then go
+    straight to the after-hours callback intake prompt. No probe, no
+    fillers, no transfer attempt — there's no one to click the Slack
+    button. The LLM continues with name + number → record_followup.
     """
     if escalation_status is not None:
         escalation_status["in_progress"] = True
@@ -218,11 +234,14 @@ async def run_escalation_flow(
             intent_summary,
         )
 
-        # Step 1 — announce to the caller. interruptible=False so the
-        # caller hears the full sentence before the silent probe pause.
-        # Track start time so the success path knows how long the
-        # announcement has been playing (we don't get a speech-done
-        # event from Cartesia, so we estimate via elapsed time).
+        # Step 1 — speak the announcement so the caller knows we heard
+        # them. We removed this briefly to avoid back-to-back "connecting
+        # you" messages when the LLM ALSO generated transition text
+        # (Haiku's atomic-rule drift). Putting it back because the
+        # silent-LLM case (atomic rule respected, OR Case 9 bypass
+        # firing — no LLM involvement at all) leaves the caller hearing
+        # nothing for 10s until the first filler. Silence is worse than
+        # occasional redundancy.
         announcement_start = time.monotonic()
         yield AgentSendText(text=spoken_announcement, interruptible=False)
 
@@ -247,8 +266,12 @@ async def run_escalation_flow(
         # page can display them. That way if the WebRTC join fails or
         # the conference is empty when the responder arrives, the
         # responder still sees who to call back and what they want.
+        #
+        # After-hours: no pickup URL — there's no one online to click
+        # the button. The Slack ping becomes an FYI for the next-day
+        # callback queue.
         pickup_url: Optional[str] = None
-        if browser_pickup and not demo_mode:
+        if browser_pickup and not demo_mode and not after_hours:
             functions_domain = os.environ.get("TWILIO_FUNCTIONS_DOMAIN", "").strip()
             if functions_domain:
                 pickup_url = (
@@ -273,6 +296,7 @@ async def run_escalation_flow(
                     caller_number,
                     demo_mode,
                     pickup_url=pickup_url,
+                    after_hours=after_hours,
                 )
             except Exception as e:
                 logger.warning("Slack ping failed (non-fatal): %s", e)
@@ -284,14 +308,22 @@ async def run_escalation_flow(
         # steps silently fail (LLM mid-tool hijack, Cartesia teardown,
         # etc.). The transfer-success / callback paths fire their own
         # final-outcome tickets later; duplication is intentional.
-        try:
-            await log_escalation_started(
+        #
+        # Spawned as a pinned background task (not awaited) for two
+        # reasons:
+        # 1) Doesn't block the generator from reaching the probe wait.
+        # 2) Survives any generator cancellation later in the flow.
+        # The task internally swallows exceptions (Slack rate limit,
+        # Linear outage), so backgrounding it is safe.
+        pending_task = asyncio.create_task(
+            log_escalation_started(
                 call_id=call_id,
                 caller_number=caller_number,
                 intent_summary=intent_summary,
             )
-        except Exception as e:
-            logger.warning("log_escalation_started failed (non-fatal): %s", e)
+        )
+        _ACTIVE_PROBE_TASKS.add(pending_task)
+        pending_task.add_done_callback(_ACTIVE_PROBE_TASKS.discard)
 
         # Step 3 — run the probe. Yield filler audio every
         # PROBE_FILLER_INTERVAL_SECONDS so the customer hears something
@@ -299,7 +331,14 @@ async def run_escalation_flow(
         # pickup mode skips the outbound cell calls — the Slack button
         # is the trigger. Both paths share the same conference-
         # participant poll as the success signal.
-        if demo_mode:
+        #
+        # After-hours: no probe at all. The team is offline so polling
+        # for participants would just burn 60s. Mark unavailable so we
+        # fall straight through to the callback intake speech.
+        if after_hours:
+            logger.info("after_hours=True — skipping probe, going to callback intake")
+            available = False
+        elif demo_mode:
             logger.info("DEMO_MODE: sleeping ~5s, then unavailable")
             await asyncio.sleep(5)
             available = False
@@ -362,31 +401,18 @@ async def run_escalation_flow(
         # rewrites the existing call's TwiML — so it's not subject to
         # that restriction.
         if available:
-            # No second speech here. The LLM's initial announcement
-            # ("Sure — one moment, connecting you to our team") already
-            # covered the "you're being transferred" signal. Adding a
-            # second "I'm connecting you to my human supervisor" right
-            # behind it made the bot sound like it was saying the same
-            # thing twice with no gap, which was confusing.
-            #
-            # We DO need to make sure the LLM's announcement has
-            # finished playing before we force-redirect — otherwise the
-            # call's TwiML switches mid-sentence and the customer hears
-            # the announcement get cut off.
-            #
-            # Estimate the announcement's spoken duration from word count
-            # (~0.4s per word) plus a small buffer. Caps at 8s so a
-            # pathologically long announcement doesn't make the customer
-            # wait forever. Beats the old hardcoded 4s which cut off
-            # longer announcements like "Yeah, that's account-specific
-            # so I'd want to get someone on our team..." (~5.5s spoken).
+            # Wait for the announcement to finish playing before the
+            # force-redirect cuts the audio. Estimate from word count
+            # (~0.4s/word + 0.5s buffer, capped at 8s) so short
+            # announcements don't strand the customer in silence and
+            # long ones aren't cut off mid-sentence.
             word_count = len(spoken_announcement.split())
             announcement_budget = min(8.0, 0.4 * word_count + 0.5)
             elapsed = time.monotonic() - announcement_start
             remaining = announcement_budget - elapsed
             if remaining > 0:
                 logger.info(
-                    "Waiting %.1fs for announcement (%d words) to finish before redirect",
+                    "Waiting %.1fs for announcement (%d words) to finish",
                     remaining,
                     word_count,
                 )
@@ -407,8 +433,17 @@ async def run_escalation_flow(
             if success:
                 if completed_flag is not None:
                     completed_flag[0] = True
-                try:
-                    await log_call_complete(
+                # Fire log_call_complete as a pinned background task,
+                # NOT an await. Reason: force-redirect just moved the
+                # customer's call out of Cartesia. Within ~1s Cartesia
+                # will close the WebSocket and cancel this generator.
+                # If we awaited log_call_complete here, the cancellation
+                # would interrupt it mid-flight — Linear ticket gets
+                # created (first await completes) but Slack DM never
+                # fires (second await cancelled). Backgrounding it
+                # ensures both run to completion.
+                log_task = asyncio.create_task(
+                    log_call_complete(
                         call_id=call_id,
                         caller_number=caller_number,
                         caller_name=None,
@@ -419,8 +454,9 @@ async def run_escalation_flow(
                             f"force-redirect. Intent: {intent_summary}"
                         ),
                     )
-                except Exception as e:
-                    logger.warning("Linear log failed (non-fatal): %s", e)
+                )
+                _ACTIVE_PROBE_TASKS.add(log_task)
+                log_task.add_done_callback(_ACTIVE_PROBE_TASKS.discard)
             else:
                 # Redirect failed (call already ended, Twilio outage,
                 # weird call state). Fall through to the callback-intake
@@ -434,10 +470,16 @@ async def run_escalation_flow(
                     interruptible=False,
                 )
         else:
-            # Probe timed out — no one clicked the Slack button within
-            # PROBE_TIMEOUT_SECONDS. Standard callback-intake fallback.
+            # Probe timed out (in-hours) OR after-hours short-circuit.
+            # Either way, run callback intake. Pick the phrasing to
+            # match the situation — "lines are busy" makes no sense
+            # at 11pm.
             yield AgentSendText(
-                text=TEAM_UNAVAILABLE_MESSAGE,
+                text=(
+                    AFTER_HOURS_UNAVAILABLE_MESSAGE
+                    if after_hours
+                    else TEAM_UNAVAILABLE_MESSAGE
+                ),
                 interruptible=False,
             )
     finally:
@@ -450,7 +492,10 @@ async def run_escalation_flow(
 
 
 def make_escalate_tool(
-    call_request: CallRequest, completed_flag=None, escalation_status=None
+    call_request: CallRequest,
+    completed_flag=None,
+    escalation_status=None,
+    after_hours: bool = False,
 ):
     """Build the escalate_to_human tool bound to this call's CallRequest.
 
@@ -472,6 +517,10 @@ def make_escalate_tool(
         _wait_for_browser_pickup checks this before attempting its own
         redirect, so the backup only kicks in when the inline path was
         never reached (LLM-hijack scenario).
+
+    `after_hours` is captured at call start (from main.get_agent's
+    business-hours check) and threaded into run_escalation_flow so the
+    same factory output behaves correctly for the whole call.
     """
 
     caller_number = call_request.from_ or "unknown"
@@ -530,6 +579,7 @@ def make_escalate_tool(
             intent_summary=intent_summary,
             completed_flag=completed_flag,
             escalation_status=escalation_status,
+            after_hours=after_hours,
         ):
             yield ev
 
@@ -830,15 +880,28 @@ async def _send_slack_ping(
     demo_mode: bool,
     *,
     pickup_url: Optional[str] = None,
+    after_hours: bool = False,
 ) -> None:
     """Notify the team that a caller is being escalated.
 
-    If pickup_url is provided (BROWSER_PICKUP mode), the message renders
-    as Block Kit with a primary "Take call in browser" button that opens
-    the per-call pickup page. Otherwise we send a plain-text message —
-    matches the legacy phone-probe flow where the cells ring directly.
+    If pickup_url is provided (BROWSER_PICKUP mode, in business hours),
+    the message renders as Block Kit with a primary "Take call in
+    browser" button that opens the per-call pickup page. After-hours
+    pings are FYI-only — no button (no one to click it) and phrasing
+    that flags the callback ticket will land in Linear for the next
+    business day.
     """
-    if pickup_url:
+    if after_hours:
+        payload = {
+            "text": (
+                f":telephone_receiver: *After-hours Basic Capital call*\n"
+                f"*Caller:* {caller_number}\n"
+                f"*Wants:* {intent_summary}\n"
+                f"_FYI — caller is being led into callback intake. A "
+                f"Linear ticket with their name and number will follow._"
+            )
+        }
+    elif pickup_url:
         payload = {
             "text": f":telephone_receiver: Incoming BC call from {caller_number}",
             "blocks": [

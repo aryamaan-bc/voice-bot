@@ -35,6 +35,9 @@ A: Basic Capital charges a plan administration fee — the exact amount depends 
 Q: Is this an IRA or a four-oh-one K?
 A: An IRA is an individual retirement account you open and own yourself. A four-oh-one K is sponsored by your employer. If you want specifics about your particular account, our team can pull those up — happy to connect you. Or if you have a general question, just let me know which type you have.
 
+Q: Where is Basic Capital based? / What's your office address? / Where are you located?
+A: We're based in SoHo, New York — at fifty-two Walker Street.
+
 # ============================================================================
 # 2. Identity verification
 # ============================================================================

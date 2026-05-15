@@ -1,10 +1,11 @@
 # Basic Capital FAQ Voice Agent
 
-Phone bot that answers general Basic Capital questions, transfers callers to a
-human when one's available, falls back to a callback intake when the team is
-tied up, and captures voicemails outside business hours. Every call ends with
-a Linear ticket + Slack DM so ops has a written record — including for callers
-who hang up mid-call and for after-hours voicemails.
+Phone bot that answers general Basic Capital questions 24/7, transfers
+callers to a human when one's available (business hours only), and falls
+back to a callback intake when the team is tied up or offline. Every call
+ends with a Linear ticket + Slack DM so ops has a written record —
+including for callers who hang up mid-call and for after-hours callback
+requests.
 
 **Public line:** `+1 (888) 460-4901` (toll-free). Routes through Cartesia's
 Twilio integration into the deployed agent.
@@ -21,7 +22,7 @@ Twilio integration into the deployed agent.
 
 ```
 voice-bot1/
-├── main.py                    # Entry point: get_agent, system prompt, business-hours gate, voicemail, Case 9 pre-LLM bypass
+├── main.py                    # Entry point: get_agent, system prompt, business-hours gate (greeting/prompt swap only — FAQ runs 24/7), Case 9 pre-LLM bypass
 ├── faqs.md                    # FAQ knowledge base (loaded at container start)
 ├── escalation.py              # run_escalation_flow (announce → Slack button → probe → force-redirect / callback intake) + user_wants_human pattern matcher
 ├── slack_ticket.py            # record_followup (callback / email logging)
@@ -162,32 +163,35 @@ cartesia logs --follow
 
 ## Call flow
 
-### Business hours (Mon–Fri, 9am–7pm ET by default)
+### Business hours (Mon–Fri, 9am–5pm ET by default)
 
-1. **Greeting** — Alex introduces by name; mentions recording + that personal advice goes to a human; asks how to help.
+1. **Greeting** — bot introduces "Basic Capital" only (no first name); mentions recording + that personal advice goes to a human; asks how to help.
 2. **FAQ match** — answers from `faqs.md` in 1–2 sentences, then asks if the caller needs anything else.
 3. **Escalation** (account-specific / advice / "I want a human" / off-FAQ). Two ways it triggers:
-   - **LLM-initiated**: Alex calls `escalate_to_human`.
+   - **LLM-initiated**: the bot calls `escalate_to_human`.
    - **Pattern-initiated (Case 9 backstop)**: `main.py`'s pre-LLM wrapper detects an explicit human-request phrase in the user's transcript and runs the escalation flow itself — even if the LLM was about to ignore the request. The first-to-fire wins; the other is a no-op.
 
    Once running, the flow:
    - Speaks the announcement, fires the Slack ping with a "Take call in browser" button, immediately writes an `escalation_pending` Linear ticket so the team has a paper trail no matter what happens next, then polls the per-call Twilio conference for a human to join.
    - Plays filler audio every ~4 seconds during the wait (tight cadence keeps Cartesia's STT from picking up unrelated caller speech and triggering an LLM hijack).
    - **Available** (human joined): log Linear ticket (`outcome=transferred`), speak "I'm connecting you to my human supervisor now," yield `AgentTransferCall` → caller bridges into the conference. A parallel **force-redirect** also fires via Twilio REST API as a belt-and-suspenders mechanism — if the LLM hijacked the tool mid-wait and the `AgentTransferCall` yield got dropped, the REST redirect still moves the caller into the conference.
-   - **Unavailable** (60s timeout, nobody clicked): Alex leads the caller straight into callback intake (name + phone), `record_followup` logs to Slack, `end_call_with_goodbye` wraps with `outcome=callback_logged`.
+   - **Unavailable** (60s timeout, nobody clicked): the bot leads the caller straight into callback intake (name + phone), `record_followup` logs to Slack, `end_call_with_goodbye` wraps with `outcome=callback_logged`.
    - **LLM hijack + tries to end the call** (Case 8): `end_call_with_goodbye` detects active escalation, replaces the LLM's farewell with a recovery message ("Sorry about that — our team has the request and someone will follow up shortly"), still logs the ticket.
 4. **Browser pickup** — the team picks up calls in a browser via WebRTC, not on their phones. The Slack "Take call in browser" button opens `agent-pickup.html`, which shows the caller's number + intent, has a Join button, and a 10s watchdog that flashes an urgent red banner ("call the customer directly at +1...") if the WebRTC handshake hangs.
 5. **Off-topic** — one polite redirect; second off-topic question → `end_call_with_goodbye(outcome=other)`.
 6. **Caller hangs up mid-call** — `CallEnded` wrapper logs `outcome=abandoned` so it still shows up in Linear/Slack.
-7. **Asked "are you a bot?"** — Alex confirms truthfully ("AI customer support specialist for Basic Capital") and offers to keep helping or transfer. Only escalates if the caller actually picks the human path. The pattern matcher deliberately does NOT match this question (it's a question, not a request — see CLAUDE.md).
+7. **Asked "what's your name?"** — bot says it's "the customer support agent for Basic Capital" (no first name).
+8. **Asked "are you a bot?"** — bot confirms truthfully ("AI customer support agent for Basic Capital") and offers to keep helping or transfer. Only escalates if the caller actually picks the human path. The pattern matcher deliberately does NOT match this question (it's a question, not a request — see CLAUDE.md).
 
 ### Outside business hours
 
-1. **Voicemail greeting** plays — mentions hours, recording disclosure, invites a quick message.
-2. **Caller speaks their message** (one turn).
-3. **LLM calls `end_voicemail`** → Linear ticket with `outcome=voicemail` and the message captured in the recap. Cartesia keeps the audio in its dashboard, linked from the Linear ticket.
-4. **Safety net**: if the LLM doesn't wrap after the first turn and the caller speaks again, a wrapper force-ends with a generic farewell + `outcome=voicemail` ticket pointing ops to the Cartesia audio. This prevents the LLM from getting stuck in a "anything else?" loop.
-5. **Silent caller** → no `UserTurnEnded` ever fires; eventually they hang up → `CallEnded` → `outcome=abandoned`.
+The FAQ agent answers everything the same way it does during business hours
+— the only differences:
+
+1. **Greeting** swaps to the after-hours version ("we're outside business hours… I can still answer general questions or take a message").
+2. **System prompt** has a short note appended telling the LLM live transfers aren't possible and to use phrasing like "let me grab your details so someone can follow up on the next business day" when calling `escalate_to_human`.
+3. **`escalate_to_human` short-circuits**: no probe wait, no filler audio, no "Take call in browser" Slack button (no one's online to click). The Slack ping fires as an FYI only, the `escalation_pending` Linear ticket lands as usual, then the bot goes straight to `AFTER_HOURS_UNAVAILABLE_MESSAGE` → standard callback intake (name + phone → `record_followup`) → `end_call_with_goodbye(outcome=callback_logged)`.
+4. **Caller hangs up mid-call** → `outcome=abandoned` ticket, same as business hours.
 
 ## Testing checklist
 
@@ -207,8 +211,9 @@ Call `+1 (888) 460-4901` and verify:
 - [ ] **Caller hangs up mid-call** → Linear ticket with `outcome=abandoned`.
 - [ ] **Off-topic** ("what's the weather?") → polite redirect; second off-topic question ends the call cleanly.
 - [ ] **Frustrated caller** ("REPRESENTATIVE REPRESENTATIVE") → bot says just "One moment." with NO apology or empathy preamble, then triggers probe.
-- [ ] **After hours** → voicemail greeting plays, caller leaves message, Linear ticket with `outcome=voicemail` lands, message in the recap.
-- [ ] **After hours, silent caller** → no message left, caller hangs up after a while → `outcome=abandoned` ticket.
+- [ ] **After hours, FAQ question** → after-hours greeting plays; bot answers the FAQ normally (e.g. 401(k) contribution limit) and asks "anything else?"
+- [ ] **After hours, asks for human** → bot speaks an after-hours-appropriate announcement (no "connecting you now"), Slack FYI ping lands with no button, no probe runs, bot goes straight to "what's your full name?" callback intake. Linear ticket with `outcome=callback_logged` lands.
+- [ ] **After hours, hangs up mid-call** → `outcome=abandoned` ticket, same as business hours.
 
 ## Common issues
 
@@ -217,7 +222,7 @@ Call `+1 (888) 460-4901` and verify:
 - **Linear auth fails** — header is `Authorization: lin_api_xxx`, NOT `Bearer lin_api_xxx`. The code already handles this.
 - **Cartesia deep-links 404** — URL must be `?tab=calls&call=ac_sid_xxx` (query params, not path segments). Make sure `CARTESIA_AGENT_ID` is set.
 - **Bot says digits weirdly** ("four hundred and one k") — pronunciation table in the system prompt has the spoken-vs-written forms; FAQ uses phonetic ("four-oh-one K") for spoken text. Tool params (Linear/Slack) should be the digit form ("401k").
-- **Bot speaks twice on hangup/escalation** — atomic-tool rule violated. `escalate_to_human` and `end_call_with_goodbye` MUST be called with no LLM-generated text in the same turn; the tool handles all speech. Same rule applies to `end_voicemail`.
+- **Bot speaks twice on hangup/escalation** — atomic-tool rule violated. `escalate_to_human` and `end_call_with_goodbye` MUST be called with no LLM-generated text in the same turn; the tool handles all speech. There's also a code-level filter in `agent_with_abandoned_logging` that buffers AgentSendText events and drops them when an atomic tool call follows in the same turn.
 - **Customer ends up in `bc-active` instead of the per-call conference** — `event.From` was empty on the conference-join webhook. `conference-join.js` falls back to a Twilio REST API `calls(sid).fetch()` lookup to recover the original `from` number. If this also returns empty, customer lands in the shared `bc-active` room and the human is alone in `bc-<caller_digits>`. Check Twilio Functions logs for the `conference-join API lookup` line.
 - **Pickup page says "Twilio is not defined"** — the Voice JS SDK URL changed. We use `https://unpkg.com/@twilio/voice-sdk@2.10.0/dist/twilio.min.js`. The official `sdk.twilio.com` URLs appear to be deprecated.
 - **Pickup page hangs on "Connecting to conference..."** — WebRTC blocked (mic permission denied, firewall, codec mismatch). After 10s the red urgent banner appears with the customer's phone number for manual callback. The `escalation_pending` Linear ticket is the team's paper trail either way.

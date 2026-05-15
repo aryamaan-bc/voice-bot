@@ -11,12 +11,22 @@ from line.agent import TurnEnv
 from line.events import (
     AgentEndCall,
     AgentSendText,
+    AgentToolCalled,
     CallEnded,
     InputEvent,
     OutputEvent,
     UserTextSent,
     UserTurnEnded,
 )
+
+
+# Tools whose "spoken_announcement" / "farewell" is the canonical
+# acknowledgement to the caller. The LLM is told (via the system prompt)
+# NEVER to generate text in the same turn as one of these calls — but
+# Haiku drifts. The wrapper below filters out any AgentSendText events
+# that arrive BEFORE an AgentToolCalled for one of these, so the tool's
+# own audio is the only "connecting you" / "goodbye" the caller hears.
+_ATOMIC_TOOLS = {"escalate_to_human", "end_call_with_goodbye"}
 from line.llm_agent import LlmAgent, LlmConfig
 from line.llm_agent.tools.decorators import passthrough_tool
 from line.voice_agent_app import AgentEnv, CallRequest, VoiceAgentApp
@@ -149,62 +159,6 @@ def make_end_call_tool(
     return end_call_with_goodbye
 
 
-def make_end_voicemail_tool(call_request: CallRequest, completed_flag=None):
-    """Factory for the voicemail-end tool used by the closed-hours agent.
-
-    Same shape as make_end_call_tool but voicemail-specific: hardcodes
-    outcome='voicemail' and intent_summary='After-hours voicemail', since
-    the closed-hours branch never has any other use case. Fewer params
-    for the LLM to choose from = fewer ways it can pick the wrong one.
-
-    Like make_end_call_tool, sets completed_flag[0] when fired so the
-    CallEnded wrapper in get_agent knows the call wrapped cleanly.
-    """
-    call_id = call_request.call_id
-    caller_number = call_request.from_ or "unknown"
-
-    @passthrough_tool
-    async def end_voicemail(
-        ctx,
-        farewell: Annotated[
-            str,
-            "Short, warm goodbye to speak before hanging up. Examples: "
-            "'Got it — our team will get back to you on the next business "
-            "day. Take care.' / 'Thanks for the message — talk soon.'",
-        ],
-        caller_name: Annotated[
-            str,
-            "Caller's name if they mentioned it during the message. "
-            "Empty string '' if they never said it.",
-        ],
-        message_summary: Annotated[
-            str,
-            "Two or three sentences capturing the caller's voicemail in "
-            "their own words, written for the ops team to scan. Include "
-            "what they wanted, any callback number or email they "
-            "mentioned, and anything time-sensitive.",
-        ],
-    ):
-        """Wrap up an after-hours voicemail: log a Linear ticket + Slack
-        summary with outcome=voicemail and the caller's message in the
-        recap, speak the farewell, and end the call. This is the only
-        way the closed-hours agent ends a call cleanly."""
-        await log_call_complete(
-            call_id=call_id,
-            caller_number=caller_number,
-            caller_name=caller_name or None,
-            intent_summary="After-hours voicemail",
-            outcome="voicemail",
-            recap=message_summary,
-        )
-        if completed_flag is not None:
-            completed_flag[0] = True
-        yield AgentSendText(text=farewell, interruptible=False)
-        yield AgentEndCall(interruptible=False)
-
-    return end_voicemail
-
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -216,15 +170,20 @@ FAQS = (Path(__file__).parent / "faqs.md").read_text()
 
 # === System prompt =========================================================
 # Notes:
-#   - Bot identity: "Alex". Greeting does NOT proactively disclose AI, but
-#     if the caller asks, Alex confirms as "AI customer support specialist"
-#     and offers continue-or-transfer (see the "Bot identity" section in
-#     the prompt below — policy updated 2026-05-01).
+#   - Bot identity: nameless. The greeting introduces "Basic Capital" only,
+#     no first name. Greeting does NOT proactively disclose AI; if the
+#     caller asks for a name, the bot says "the customer support agent
+#     for Basic Capital." If the caller asks if it's a bot/AI, the bot
+#     confirms as "AI customer support agent for Basic Capital" and
+#     offers continue-or-transfer (see the "Bot identity" section in
+#     the prompt below).
 #   - Account-specific data → escalate. General how-to (even with "my") → answer.
 #   - Compliance-verbatim phrases live at the bottom of faqs.md.
-SYSTEM_PROMPT = f"""You are Alex, the phone assistant for Basic Capital. \
-You answer general questions about Basic Capital using the FAQ below and \
-hand off to our team when needed.
+SYSTEM_PROMPT = f"""You are the phone assistant for Basic Capital. You \
+answer general questions about Basic Capital using the FAQ below and \
+hand off to our team when needed. You do NOT have a first name — never \
+introduce yourself with one, never say "I'm <name>", never sign off \
+with one.
 
 # ⚠️ CRITICAL — Tool calls that speak are ATOMIC
 Two tools speak to the caller themselves: `escalate_to_human` and \
@@ -491,22 +450,26 @@ contact_method="email" and no callback_number. The bot doesn't OFFER \
 email proactively anymore — but if the caller picks it, accommodate.
 
 # Bot identity
+You don't have a first name. If asked "what's your name?" or "who am I \
+talking to?", say something like "I'm the customer support agent for \
+Basic Capital" — keep it neutral, no first name.
+
 If asked whether you're a bot, AI, automated, or real, BE TRUTHFUL. \
-Confirm you're an AI customer support specialist for Basic Capital, \
-then reassure the caller you can help with most general questions and \
-offer to connect them with a human if they prefer. Don't escalate just \
+Confirm you're an AI customer support agent for Basic Capital, then \
+reassure the caller you can help with most general questions and offer \
+to connect them with a human if they prefer. Don't escalate just \
 because they asked — only escalate if they actually say they want a \
 human after your reply.
 
 Example phrasings (vary naturally — these are NOT scripts to read \
 verbatim):
-- "Yeah, I'm an AI customer support specialist for Basic Capital — but \
-I can answer most general questions about accounts, contributions, \
+- "Yeah, I'm an AI customer support agent for Basic Capital — but I \
+can answer most general questions about accounts, contributions, \
 rollovers, and the like. Or if you'd prefer to talk to someone on our \
 team, just say the word."
-- "I am — I'm Basic Capital's AI customer support specialist. I can \
-handle most general questions, but happy to connect you with a human \
-if you'd rather. What works for you?"
+- "I am — I'm Basic Capital's AI customer support agent. I can handle \
+most general questions, but happy to connect you with a human if \
+you'd rather. What works for you?"
 
 If they then say they want a human, escalate via escalate_to_human \
 following the rules above. If they say they're fine continuing with \
@@ -597,12 +560,53 @@ if you never asked.
 
 
 GREETING = (
-    "Hey, thanks for calling Basic Capital, this is Alex. The call's "
-    "recorded. I can connect you with someone on our team right now "
-    "if you'd like — or I can answer general questions about your "
-    "account, contributions, withdrawals, and the like. What works "
-    "for you?"
+    "Hey, thanks for calling Basic Capital. Just so you know, this "
+    "call is being recorded. I can connect you with someone on our "
+    "team right now if you'd like — or I can answer general questions "
+    "about your account, contributions, withdrawals, and the like. "
+    "What works for you?"
 )
+
+
+AFTER_HOURS_GREETING = (
+    "Hey, thanks for calling Basic Capital. Just so you know, this "
+    "call is being recorded. We're outside business hours — back "
+    "Monday through Friday, nine in the morning to five in the "
+    "evening Eastern time — so our team's offline right now. I can "
+    "still answer general questions about your account, "
+    "contributions, withdrawals, and the like, or take a message "
+    "so someone follows up on the next business day. What can I "
+    "help with?"
+)
+
+
+AFTER_HOURS_PROMPT_NOTE = """
+
+# ⚠️ After-hours mode (this call is outside business hours)
+Business hours are Monday through Friday, nine in the morning to five \
+in the evening Eastern time. Right now, the team is OFFLINE — you \
+CANNOT connect this caller to a live human. The escalate_to_human tool \
+will automatically run the callback intake flow instead of probing the \
+team.
+
+When you call escalate_to_human, your `spoken_announcement` should \
+reflect that no immediate transfer is possible. AVOID phrases like \
+"connecting you now", "one moment, getting someone", "connecting you \
+to our team" — they imply a live transfer that won't happen. Use \
+phrasing like:
+  - "Sure — let me grab your details so someone can follow up on the \
+next business day. One sec."
+  - "Yeah, that's account-specific so I'd want our team to take a \
+look. They're offline right now, but let me grab your info so they \
+can reach out first thing."
+  - "Got it — I can't pull that up myself, but our team can. They're \
+out until the next business day; let me take down your details so \
+they can follow up."
+
+Everything else (FAQ answering, the atomic-tool rule, the callback \
+intake flow after escalate_to_human, pronunciation conventions) is \
+identical to business hours.
+"""
 
 
 # === Business-hours gate ===================================================
@@ -613,195 +617,31 @@ def _is_within_business_hours(now: datetime) -> bool:
     tz = ZoneInfo(os.environ.get("BUSINESS_HOURS_TZ", "America/New_York"))
     local = now.astimezone(tz)
     start_hour = int(os.environ.get("BUSINESS_HOURS_START_HOUR", "9"))
-    end_hour = int(os.environ.get("BUSINESS_HOURS_END_HOUR", "19"))
+    end_hour = int(os.environ.get("BUSINESS_HOURS_END_HOUR", "17"))
     weekdays_only = os.environ.get("BUSINESS_HOURS_WEEKDAYS_ONLY", "true").lower() == "true"
     if weekdays_only and local.weekday() >= 5:  # 5=Sat, 6=Sun
         return False
     return start_hour <= local.hour < end_hour
 
 
-VOICEMAIL_GREETING = (
-    "Thanks for calling Basic Capital. We're closed right now — back "
-    "Monday through Friday, nine in the morning to seven in the evening "
-    "Eastern time. Heads-up that the call's recorded. Leave a quick "
-    "message and our team will get back to you on the next business "
-    "day. Or email support at basic capital dot com if that's easier. "
-    "Go ahead — I'm listening."
-)
-
-
-VOICEMAIL_SYSTEM_PROMPT = """You are Alex, the after-hours voicemail \
-assistant for Basic Capital.
-
-The caller is calling outside business hours. They just heard a greeting \
-inviting them to leave a message. Your ONLY job: capture one message, \
-then call `end_voicemail`. You are NOT having a conversation.
-
-# The flow — strict
-Exactly two things happen:
-1. The caller speaks their message (one turn).
-2. You call `end_voicemail` immediately after they finish.
-
-That's it. No follow-up questions. No "anything else?". No acknowledgement \
-mid-message ("got it" / "mm-hmm" / "okay"). The greeting was the last \
-audio the caller hears from you before the farewell inside `end_voicemail`.
-
-# Calling end_voicemail
-The moment the caller finishes their message, call:
-
-    end_voicemail(
-        farewell="<short warm goodbye, e.g. 'Got it — our team will get \
-back to you on the next business day. Take care.'>",
-        caller_name="<their name if they mentioned it during the message, \
-else ''>",
-        message_summary="<2-3 sentences capturing what they said in their \
-own words, written for ops to scan. Include callback number/email if they \
-gave one, and anything time-sensitive.>"
-    )
-
-Atomic-tool rule: generate NO text in the same turn as `end_voicemail`. \
-The tool's `farewell` is the only thing the caller hears next.
-
-# What NOT to do
-- Don't ask follow-up questions ("anything else?", "what's a good number?", \
-"can you give me more detail?"). The team will follow up — your job is \
-to capture, not interview.
-- Don't acknowledge mid-message ("got it", "mm-hmm", "okay"). Stay silent \
-while they speak.
-- Don't try to answer Basic Capital questions. We're closed.
-- Don't try to escalate or transfer. No one's around. Just capture.
-- Don't recap the message back to the caller out loud. Capture it in \
-`message_summary` and end the call.
-
-# Edge cases (still one-shot)
-- They say "transfer me to a human" → their request IS the message. \
-Capture it in `message_summary` and call `end_voicemail`. Don't argue \
-about availability.
-- They ask a question → that IS the message. Capture it as their ask in \
-`message_summary` and call `end_voicemail`. Don't try to answer.
-- They ramble across multiple thoughts in one turn → that's still one \
-message. Capture all of it in `message_summary` when they pause.
-
-# Pronunciation (same as main agent)
-Spoken (farewell): phonetic forms — "four-oh-one K", "I R A", \
-"fifty-nine and a half". Written (`message_summary`): digit/abbreviation \
-forms — "401k", "IRA", "59½".
-"""
-
-
-def make_closed_hours_agent(call_request: CallRequest):
-    """LLM-driven voicemail agent for out-of-hours calls.
-
-    Replaces the previous fire-and-hangup behavior. Greets the caller,
-    invites a message, listens, and when they're done the LLM calls
-    `end_voicemail` to log a Linear ticket with outcome='voicemail' and
-    the caller's message in the recap.
-
-    Cartesia records the bot↔caller audio as usual, so the voicemail
-    audio is available via the Cartesia deep-link in the Linear ticket
-    (no separate Twilio recording needed for this path).
-
-    Like the main agent, this is wrapped in a CallEnded handler so that
-    a caller who hangs up before leaving a message still produces an
-    'abandoned' Linear ticket.
-    """
-    completed = [False]
-    # Counts UserTurnEnded events. The voicemail flow should be exactly
-    # one user turn (the message) followed by end_voicemail. If the LLM
-    # asks a follow-up and the caller speaks a SECOND time, we force-end
-    # — see the wrapper below.
-    user_turns = [0]
-
-    llm_agent = LlmAgent(
-        model="anthropic/claude-haiku-4-5",
-        api_key=os.environ.get("ANTHROPIC_API_KEY"),
-        tools=[make_end_voicemail_tool(call_request, completed_flag=completed)],
-        config=LlmConfig(
-            system_prompt=VOICEMAIL_SYSTEM_PROMPT,
-            introduction=VOICEMAIL_GREETING,
-        ),
-    )
-
-    call_id = call_request.call_id
-    caller_number = call_request.from_ or "unknown"
-
-    async def voicemail_agent_with_abandoned_logging(
-        turn_env: TurnEnv, event: InputEvent
-    ) -> AsyncIterable[OutputEvent]:
-        if isinstance(event, CallEnded) and not completed[0]:
-            logger.info(
-                "Closed-hours call %s ended without voicemail — logging abandoned",
-                call_id,
-            )
-            await log_call_complete(
-                call_id=call_id,
-                caller_number=caller_number,
-                caller_name=None,
-                intent_summary="Closed-hours hangup before voicemail",
-                outcome="abandoned",
-                recap=(
-                    "Caller dialed in after hours and hung up before leaving "
-                    "a message. Cartesia transcript captures whatever was "
-                    "said (if anything) before they disconnected."
-                ),
-            )
-            completed[0] = True
-            return
-
-        # Hard cap: voicemail is one message, not a chat. If the caller
-        # has already spoken once and is speaking again, the LLM drifted
-        # past the strict "one turn → end_voicemail" rule. Force-end here
-        # so chatty/anxious callers don't get stuck in a loop with Alex.
-        if isinstance(event, UserTurnEnded):
-            user_turns[0] += 1
-            if user_turns[0] >= 2 and not completed[0]:
-                logger.warning(
-                    "Voicemail %s: %d user turns without LLM wrapping — "
-                    "forcing end_voicemail",
-                    call_id,
-                    user_turns[0],
-                )
-                await log_call_complete(
-                    call_id=call_id,
-                    caller_number=caller_number,
-                    caller_name=None,
-                    intent_summary="After-hours voicemail (turn cap forced)",
-                    outcome="voicemail",
-                    recap=(
-                        "Voicemail wrap forced after the caller spoke "
-                        "multiple times — the LLM didn't call end_voicemail "
-                        "cleanly. Listen to the Cartesia audio for the "
-                        "actual message content."
-                    ),
-                )
-                completed[0] = True
-                yield AgentSendText(
-                    text=(
-                        "Got it — passing this along. Our team will get "
-                        "back to you on the next business day. Take care."
-                    ),
-                    interruptible=False,
-                )
-                yield AgentEndCall(interruptible=False)
-                return
-
-        async for output in llm_agent.process(turn_env, event):
-            yield output
-
-    return voicemail_agent_with_abandoned_logging
-
-
 # === Agent factory =========================================================
 
 
 async def get_agent(env: AgentEnv, call_request: CallRequest):
-    """Build the agent for a new incoming call."""
-    if not _is_within_business_hours(datetime.now(tz=ZoneInfo("UTC"))):
-        logger.info("Call %s outside business hours — serving closed agent", call_request.call_id)
-        return make_closed_hours_agent(call_request)
+    """Build the agent for a new incoming call.
 
+    The FAQ agent answers 24/7. Outside business hours we swap in an
+    after-hours greeting + a small system-prompt note so the LLM knows
+    live transfers aren't possible, and pass `after_hours=True` to the
+    escalate tool so it short-circuits the probe and goes straight to
+    callback intake (no one's there to click the Slack button).
+    """
+    after_hours = not _is_within_business_hours(datetime.now(tz=ZoneInfo("UTC")))
     logger.info(
-        "Call %s from %s — serving main agent", call_request.call_id, call_request.from_
+        "Call %s from %s — serving main agent (after_hours=%s)",
+        call_request.call_id,
+        call_request.from_,
+        after_hours,
     )
 
     # Single-element list as a mutable closure cell shared between the
@@ -830,6 +670,7 @@ async def get_agent(env: AgentEnv, call_request: CallRequest):
                 call_request,
                 completed_flag=completed,
                 escalation_status=escalation_status,
+                after_hours=after_hours,
             ),
             make_followup_tool(call_request, escalation_status=escalation_status),
             make_end_call_tool(
@@ -839,8 +680,8 @@ async def get_agent(env: AgentEnv, call_request: CallRequest):
             ),
         ],
         config=LlmConfig(
-            system_prompt=SYSTEM_PROMPT,
-            introduction=GREETING,
+            system_prompt=SYSTEM_PROMPT + (AFTER_HOURS_PROMPT_NOTE if after_hours else ""),
+            introduction=AFTER_HOURS_GREETING if after_hours else GREETING,
         ),
     )
 
@@ -897,7 +738,10 @@ async def get_agent(env: AgentEnv, call_request: CallRequest):
                     call_id=call_id,
                     caller_number=caller_number,
                     spoken_announcement=(
-                        "Sure — one moment, connecting you to our team."
+                        "Sure — let me grab your details so someone can "
+                        "follow up on the next business day. One sec."
+                        if after_hours
+                        else "Sure — one moment, connecting you to our team."
                     ),
                     intent_summary=(
                         f"Caller explicitly asked for a human "
@@ -905,6 +749,7 @@ async def get_agent(env: AgentEnv, call_request: CallRequest):
                     ),
                     completed_flag=completed,
                     escalation_status=escalation_status,
+                    after_hours=after_hours,
                 ):
                     yield ev_out
                 return
@@ -929,8 +774,50 @@ async def get_agent(env: AgentEnv, call_request: CallRequest):
             )
             return
 
+        # Atomic-tool rule enforcement. Buffer AgentSendText events as
+        # they arrive from the LLM. If an AgentToolCalled for one of
+        # the atomic tools arrives, drop the buffered text — the tool
+        # is the canonical source of the acknowledgement. Otherwise
+        # flush buffered text on the next non-text event (the turn is
+        # a normal FAQ response). System prompt asks the LLM to follow
+        # this rule, but Haiku drifts — this is the code-level floor.
+        text_buffer: list[OutputEvent] = []
+        atomic_tool_seen = False
         async for output in llm_agent.process(turn_env, event):
-            yield output
+            if atomic_tool_seen:
+                # We already dropped pre-tool text; just pass through
+                # whatever else the tool produces.
+                yield output
+                continue
+
+            if (
+                isinstance(output, AgentToolCalled)
+                and getattr(output, "name", None) in _ATOMIC_TOOLS
+            ):
+                if text_buffer:
+                    logger.info(
+                        "Dropping %d pre-tool AgentSendText event(s) "
+                        "before %s (atomic-tool rule)",
+                        len(text_buffer),
+                        output.name,
+                    )
+                text_buffer.clear()
+                atomic_tool_seen = True
+                yield output
+            elif isinstance(output, AgentSendText):
+                text_buffer.append(output)
+            else:
+                # Non-text, non-atomic-tool event — flush buffer and
+                # pass through. Means this turn is not an atomic-tool
+                # turn so the LLM text was legitimate speech.
+                for buffered in text_buffer:
+                    yield buffered
+                text_buffer.clear()
+                yield output
+        # End of stream — flush any remaining buffered text. Reaches
+        # this for normal FAQ turns where the only output was text.
+        for buffered in text_buffer:
+            yield buffered
 
     return agent_with_abandoned_logging
 
