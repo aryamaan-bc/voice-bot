@@ -191,6 +191,41 @@ def make_followup_tool(call_request: CallRequest, escalation_status=None):
     return record_followup
 
 
+async def send_queue_entry_ping(
+    webhook_url: str,
+    *,
+    caller_number: str,
+    intent_summary: str,
+    position: int,
+) -> None:
+    """Notify the team that a caller has entered the hold queue.
+
+    Informational only — no "Take call in browser" button here. That
+    button fires from escalation.py's `_send_slack_ping` once the
+    caller has been dispatched out of the queue into the probe path
+    (which is when there's actually a slot for the rep to fill).
+
+    Mirrors `_send_slack_ping`'s text shape so the team's Slack channel
+    has a consistent format across queue-entry and dispatch events.
+    """
+    payload = {
+        "text": (
+            f":hourglass_flowing_sand: *BC call queued (#{position} in line)*\n"
+            f"*Caller:* {caller_number}\n"
+            f"*Wants:* {intent_summary}\n"
+            f"_Waiting for a rep to free up. Dispatch ping with pickup "
+            f"button will follow when their turn comes._"
+        )
+    }
+    async with httpx.AsyncClient(timeout=5) as client:
+        resp = await client.post(webhook_url, json=payload)
+    resp.raise_for_status()
+    logger.info(
+        "queue-entry Slack ping sent (status=%s, position=%d)",
+        resp.status_code, position,
+    )
+
+
 def _email_fallback_instruction(caller_name: str = "") -> str:
     """When Slack fails, return the exact wording for the bot to speak.
     No meta prefix — the system prompt tells the LLM to speak the return

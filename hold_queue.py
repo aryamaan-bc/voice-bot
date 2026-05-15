@@ -110,6 +110,32 @@ async def enqueue(entry: QueueEntry) -> int:
     return pos
 
 
+async def try_admit() -> bool:
+    """Atomically attempt to claim a slot bypassing the queue. Returns
+    True iff the queue is empty AND a Twilio slot is free; in that case
+    _ACTIVE_PROBES is incremented and the caller proceeds straight to
+    the probe path. Returns False otherwise — caller should enqueue +
+    wait_for_dispatch.
+
+    FIFO discipline is preserved: if anyone is already queued, a new
+    arrival queues behind them even if a slot would otherwise be free.
+    Same race-prevention as wait_for_dispatch (lock + counter).
+    """
+    global _ACTIVE_PROBES
+    async with _QUEUE_LOCK:
+        if _QUEUE:
+            return False
+        active_confs = _count_active_conferences()
+        if active_confs + _ACTIVE_PROBES >= _max_concurrent_reps():
+            return False
+        _ACTIVE_PROBES += 1
+        logger.info(
+            "queue.try_admit DIRECT-ADMIT active_confs=%d active_probes=%d max=%d",
+            active_confs, _ACTIVE_PROBES, _max_concurrent_reps(),
+        )
+        return True
+
+
 async def position(call_id: str) -> Optional[int]:
     """1-indexed position of `call_id` in the queue, or None if not
     queued. O(n) scan; fine for the v1 cap of ~10 waiters."""

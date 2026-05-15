@@ -46,7 +46,10 @@ from line.llm_agent.tools.decorators import passthrough_tool
 from line.voice_agent_app import CallRequest
 from twilio.rest import Client
 
+import hold_queue
+from hold_queue import QueueEntry
 from linear_ticket import log_call_complete, log_escalation_started
+from slack_ticket import send_queue_entry_ping
 
 logger = logging.getLogger(__name__)
 
@@ -116,12 +119,179 @@ AFTER_HOURS_UNAVAILABLE_MESSAGE = (
     "follow up on the next business day — what's your full name?"
 )
 
+# Spoken when a queued caller's MAX_QUEUE_WAIT_SECONDS elapses without a
+# rep freeing up. Acknowledges the wait + transitions to the standard
+# callback-intake flow (the LLM then drives name + number + record_followup).
+QUEUE_TIMEOUT_INTAKE_MESSAGE = (
+    "Thanks for holding — sorry the wait's running long. Let me grab your "
+    "name and a callback number and we'll reach out as soon as a rep "
+    "frees up. What's your full name?"
+)
+
+# Spoken when a queued caller's turn finally comes up. Replaces the
+# LLM-passed `spoken_announcement` for the queue path (the original was
+# minted for a direct-admit context where the caller hasn't heard
+# anything yet; here they've already heard the queue-entry message and
+# position updates, so the wording needs to acknowledge that wait).
+QUEUE_DISPATCH_TRANSITION_MESSAGE = (
+    "Got a rep for you now — one moment."
+)
+
 
 def _env(name: str, *, required: bool = True) -> str:
     val = os.environ.get(name, "")
     if required and not val:
         raise RuntimeError(f"Missing required env var: {name}")
     return val
+
+
+def _int_env(name: str, default: int) -> int:
+    """Same as hold_queue._int_env but local to avoid the cross-module
+    coupling for what's a small helper."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("invalid %s=%r in env; using default %d", name, raw, default)
+        return default
+
+
+def _queue_enabled() -> bool:
+    return os.environ.get("QUEUE_ENABLED", "").strip().lower() in ("1", "true", "yes")
+
+
+async def _yield_callback_intake_message(
+    *, after_hours: bool = False, queue_timeout: bool = False
+):
+    """Speak the message that leads the caller into name+number intake.
+    Picks phrasing for the situation; the LLM drives the rest of the
+    intake (asks for name → number → calls record_followup). Called from
+    the probe-failure tail of run_escalation_flow AND from the queue
+    hard-timeout branch of _wait_in_queue.
+    """
+    if queue_timeout:
+        msg = QUEUE_TIMEOUT_INTAKE_MESSAGE
+    elif after_hours:
+        msg = AFTER_HOURS_UNAVAILABLE_MESSAGE
+    else:
+        msg = TEAM_UNAVAILABLE_MESSAGE
+    yield AgentSendText(text=msg, interruptible=False)
+
+
+async def _wait_in_queue(
+    *,
+    call_id: str,
+    caller_number: str,
+    intent_summary: str,
+    completed_flag,
+    escalation_status,
+):
+    """Queue admission tail: enqueue this caller, yield position updates
+    until dispatched / hard-timeout / hangup. Yields agent events.
+
+    On exit, `escalation_status["phase"]` indicates the outcome:
+      - "probe_wait": caller was dispatched; _ACTIVE_PROBES was
+        incremented inside hold_queue.wait_for_dispatch. Caller should
+        proceed into the probe path. Caller's finally must call
+        hold_queue.release_probe_slot.
+      - "idle": hangup (caller left mid-queue) OR hard-timeout (already
+        yielded the intake message). Caller should return without
+        running the probe.
+    """
+    entry = QueueEntry(
+        call_id=call_id,
+        caller_number=caller_number,
+        intent_summary=intent_summary,
+        entered_at=time.time(),
+        completed_flag=completed_flag,
+    )
+    escalation_status["phase"] = "queue_wait"
+    position = await hold_queue.enqueue(entry)
+
+    yield AgentSendText(
+        text=(
+            f"All our reps are with customers right now. You're #{position} "
+            f"in line — hang tight, we'll connect you as soon as someone "
+            f"frees up."
+        ),
+        interruptible=False,
+    )
+
+    # Linear paper trail for the queue entry. Pinned background task so
+    # generator cancellation doesn't drop it (same pattern as
+    # log_escalation_started).
+    queue_log_task = asyncio.create_task(
+        log_call_complete(
+            call_id=call_id,
+            caller_number=caller_number,
+            caller_name=None,
+            intent_summary=intent_summary,
+            outcome="queue_waiting",
+            recap=f"Caller queued at position {position}; awaiting dispatch.",
+        )
+    )
+    _ACTIVE_PROBE_TASKS.add(queue_log_task)
+    queue_log_task.add_done_callback(_ACTIVE_PROBE_TASKS.discard)
+
+    # Slack ping (informational; no button until dispatch).
+    slack_url = os.environ.get("SLACK_WEBHOOK_URL", "")
+    if slack_url:
+        try:
+            await send_queue_entry_ping(
+                slack_url,
+                caller_number=caller_number,
+                intent_summary=intent_summary,
+                position=position,
+            )
+        except Exception as e:
+            logger.warning("queue-entry Slack ping failed (non-fatal): %s", e)
+
+    update_interval = _int_env("QUEUE_POSITION_UPDATE_INTERVAL_SECONDS", 45)
+    max_wait = _int_env("MAX_QUEUE_WAIT_SECONDS", 300)
+    started = time.monotonic()
+
+    while True:
+        elapsed = time.monotonic() - started
+        if elapsed >= max_wait:
+            # Case 11: hard-timeout → callback intake.
+            logger.info(
+                "queue hard-timeout call_id=%s elapsed=%.0fs", call_id, elapsed
+            )
+            async for ev in _yield_callback_intake_message(queue_timeout=True):
+                yield ev
+            await hold_queue.dequeue(call_id)
+            escalation_status["phase"] = "idle"
+            return
+
+        try:
+            dispatched = await asyncio.wait_for(
+                hold_queue.wait_for_dispatch(call_id, completed_flag),
+                timeout=min(update_interval, max_wait - elapsed),
+            )
+        except asyncio.TimeoutError:
+            new_pos = await hold_queue.position(call_id)
+            if new_pos is not None:
+                yield AgentSendText(
+                    text=f"Still here with you — you're #{new_pos} in line.",
+                    interruptible=False,
+                )
+            continue
+
+        if not dispatched:
+            # Case 10: hangup. main.py's CallEnded handler also calls
+            # hold_queue.dequeue (defense-in-depth); we don't here.
+            logger.info("queue dispatch returned hangup call_id=%s", call_id)
+            escalation_status["phase"] = "idle"
+            return
+
+        # Dispatched — caller proceeds into probe path.
+        escalation_status["phase"] = "probe_wait"
+        logger.info(
+            "queue dispatch SUCCESS call_id=%s — transitioning to probe", call_id
+        )
+        return
 
 
 # === Pattern-based escalation detector =====================================
@@ -218,8 +388,9 @@ async def run_escalation_flow(
     `escalation_status` is an optional dict with key "phase" (string).
     Set to "probe_wait" at entry, reset to "idle" at exit so
     end_call_with_goodbye can detect Case 8 (LLM hijack ending the call
-    mid-escalation). Future queue work introduces additional phase
-    values ("queue_wait", "dispatched"); v1 only uses "idle"/"probe_wait".
+    mid-escalation). When QUEUE_ENABLED=true and all reps are busy, the
+    flow diverts into the queue path first (phase="queue_wait") and
+    transitions to "probe_wait" on dispatch — see _wait_in_queue.
 
     `after_hours=True` short-circuits the probe: speak the announcement,
     fire a no-button Slack FYI ping + the pending Linear ticket, then go
@@ -227,14 +398,53 @@ async def run_escalation_flow(
     fillers, no transfer attempt — there's no one to click the Slack
     button. The LLM continues with name + number → record_followup.
     """
-    if escalation_status is not None:
-        escalation_status["phase"] = "probe_wait"
+    browser_pickup_for_admit = (
+        os.environ.get("BROWSER_PICKUP", "").strip().lower()
+        in ("1", "true", "yes")
+    )
+
+    slot_acquired = False
+    queued_then_dispatched = False
+
     try:
         logger.info(
             "escalation flow START call_id=%s intent=%r",
             call_id,
             intent_summary,
         )
+
+        # Step 0 — queue admission. Only in business hours, only in
+        # browser-pickup mode (queued dispatch requires the per-call
+        # conference + force-redirect path; legacy cell-probe path
+        # doesn't support graceful queueing). If QUEUE_ENABLED=false
+        # OR after-hours OR no-browser-pickup, the existing behavior
+        # runs unchanged.
+        if _queue_enabled() and browser_pickup_for_admit and not after_hours:
+            if await hold_queue.try_admit():
+                slot_acquired = True
+                if escalation_status is not None:
+                    escalation_status["phase"] = "probe_wait"
+            else:
+                # Queue this caller. _wait_in_queue manages the queue_wait
+                # phase + yields position updates; on dispatch it flips
+                # phase to "probe_wait" and returns, falling into the
+                # probe code below. On hangup/timeout it yields the right
+                # message itself and we return early.
+                async for ev in _wait_in_queue(
+                    call_id=call_id,
+                    caller_number=caller_number,
+                    intent_summary=intent_summary,
+                    completed_flag=completed_flag,
+                    escalation_status=escalation_status,
+                ):
+                    yield ev
+                if escalation_status is None or escalation_status["phase"] != "probe_wait":
+                    return  # hangup or hard-timeout — nothing more to do
+                slot_acquired = True
+                queued_then_dispatched = True
+        else:
+            if escalation_status is not None:
+                escalation_status["phase"] = "probe_wait"
 
         # Step 1 — speak the announcement so the caller knows we heard
         # them. We removed this briefly to avoid back-to-back "connecting
@@ -243,9 +453,17 @@ async def run_escalation_flow(
         # silent-LLM case (atomic rule respected, OR Case 9 bypass
         # firing — no LLM involvement at all) leaves the caller hearing
         # nothing for 10s until the first filler. Silence is worse than
-        # occasional redundancy.
+        # occasional redundancy. Queue-dispatch path uses a fixed
+        # transition message instead of the LLM-passed announcement
+        # (which would say "connecting you" right after the caller heard
+        # a 5-minute queue wait — incoherent).
+        announced_text = (
+            QUEUE_DISPATCH_TRANSITION_MESSAGE
+            if queued_then_dispatched
+            else spoken_announcement
+        )
         announcement_start = time.monotonic()
-        yield AgentSendText(text=spoken_announcement, interruptible=False)
+        yield AgentSendText(text=announced_text, interruptible=False)
 
         # Step 2 — fire the team Slack ping. AWAITED so it can't be
         # silently dropped (this was a bug previously when it was
@@ -317,15 +535,21 @@ async def run_escalation_flow(
         # 2) Survives any generator cancellation later in the flow.
         # The task internally swallows exceptions (Slack rate limit,
         # Linear outage), so backgrounding it is safe.
-        pending_task = asyncio.create_task(
-            log_escalation_started(
-                call_id=call_id,
-                caller_number=caller_number,
-                intent_summary=intent_summary,
+        #
+        # Skip if we're here via the queue dispatch path — the
+        # queue_waiting ticket already covered the paper-trail role
+        # at queue entry time; firing escalation_pending here too
+        # would create a redundant third "in progress" ticket per call.
+        if not queued_then_dispatched:
+            pending_task = asyncio.create_task(
+                log_escalation_started(
+                    call_id=call_id,
+                    caller_number=caller_number,
+                    intent_summary=intent_summary,
+                )
             )
-        )
-        _ACTIVE_PROBE_TASKS.add(pending_task)
-        pending_task.add_done_callback(_ACTIVE_PROBE_TASKS.discard)
+            _ACTIVE_PROBE_TASKS.add(pending_task)
+            pending_task.add_done_callback(_ACTIVE_PROBE_TASKS.discard)
 
         # Step 3 — run the probe. Yield filler audio every
         # PROBE_FILLER_INTERVAL_SECONDS so the customer hears something
@@ -408,7 +632,7 @@ async def run_escalation_flow(
             # (~0.4s/word + 0.5s buffer, capped at 8s) so short
             # announcements don't strand the customer in silence and
             # long ones aren't cut off mid-sentence.
-            word_count = len(spoken_announcement.split())
+            word_count = len(announced_text.split())
             announcement_budget = min(8.0, 0.4 * word_count + 0.5)
             elapsed = time.monotonic() - announcement_start
             remaining = announcement_budget - elapsed
@@ -467,23 +691,15 @@ async def run_escalation_flow(
                     "Primary force-redirect failed — falling back to "
                     "callback intake"
                 )
-                yield AgentSendText(
-                    text=TEAM_UNAVAILABLE_MESSAGE,
-                    interruptible=False,
-                )
+                async for ev in _yield_callback_intake_message():
+                    yield ev
         else:
             # Probe timed out (in-hours) OR after-hours short-circuit.
             # Either way, run callback intake. Pick the phrasing to
             # match the situation — "lines are busy" makes no sense
             # at 11pm.
-            yield AgentSendText(
-                text=(
-                    AFTER_HOURS_UNAVAILABLE_MESSAGE
-                    if after_hours
-                    else TEAM_UNAVAILABLE_MESSAGE
-                ),
-                interruptible=False,
-            )
+            async for ev in _yield_callback_intake_message(after_hours=after_hours):
+                yield ev
     finally:
         # Always reset phase to "idle", even if the generator is cancelled
         # mid-flow by an LLM hijack. This way end_call_with_goodbye
@@ -491,6 +707,13 @@ async def run_escalation_flow(
         # escalation anymore" and ends normally.
         if escalation_status is not None:
             escalation_status["phase"] = "idle"
+        if slot_acquired:
+            # Match the increment from try_admit() or wait_for_dispatch()
+            # so the queue's MAX_CONCURRENT_REPS bookkeeping stays
+            # accurate. release_probe_slot is idempotent in spirit (a
+            # second decrement would just floor at 0) but should match
+            # exactly one increment per call.
+            await hold_queue.release_probe_slot()
 
 
 def make_escalate_tool(

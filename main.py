@@ -31,6 +31,7 @@ from line.llm_agent import LlmAgent, LlmConfig
 from line.llm_agent.tools.decorators import passthrough_tool
 from line.voice_agent_app import AgentEnv, CallRequest, VoiceAgentApp
 
+import hold_queue
 from escalation import make_escalate_tool, run_escalation_flow, user_wants_human
 from linear_ticket import log_call_complete
 from slack_ticket import make_followup_tool
@@ -702,19 +703,43 @@ async def get_agent(env: AgentEnv, call_request: CallRequest):
         turn_env: TurnEnv, event: InputEvent
     ) -> AsyncIterable[OutputEvent]:
         if isinstance(event, CallEnded) and not completed[0]:
-            logger.info("Call %s ended without clean wrap — logging abandoned", call_id)
-            await log_call_complete(
-                call_id=call_id,
-                caller_number=caller_number,
-                caller_name=None,
-                intent_summary="Caller hung up mid-call",
-                outcome="abandoned",
-                recap=(
-                    "Caller disconnected before the call wrapped up cleanly — "
-                    "no goodbye, no transfer, no follow-up was logged. Audio "
-                    "and full transcript are in the Cartesia dashboard."
-                ),
-            )
+            # Case 10: if the caller hung up while queued, log the more
+            # specific abandoned_in_queue outcome (for capacity-planning
+            # analytics) and dequeue the entry so it doesn't block the
+            # next customer's position. The hold_queue.dequeue call is
+            # idempotent — safe even if _wait_in_queue's own hangup
+            # branch already popped the entry.
+            if escalation_status["phase"] == "queue_wait":
+                logger.info(
+                    "Call %s ended while queued — logging abandoned_in_queue + dequeue",
+                    call_id,
+                )
+                await hold_queue.dequeue(call_id)
+                await log_call_complete(
+                    call_id=call_id,
+                    caller_number=caller_number,
+                    caller_name=None,
+                    intent_summary="Caller hung up while queued",
+                    outcome="abandoned_in_queue",
+                    recap=(
+                        "Caller disconnected while waiting in the hold queue. "
+                        "Audio and full transcript are in the Cartesia dashboard."
+                    ),
+                )
+            else:
+                logger.info("Call %s ended without clean wrap — logging abandoned", call_id)
+                await log_call_complete(
+                    call_id=call_id,
+                    caller_number=caller_number,
+                    caller_name=None,
+                    intent_summary="Caller hung up mid-call",
+                    outcome="abandoned",
+                    recap=(
+                        "Caller disconnected before the call wrapped up cleanly — "
+                        "no goodbye, no transfer, no follow-up was logged. Audio "
+                        "and full transcript are in the Cartesia dashboard."
+                    ),
+                )
             completed[0] = True
             return
 
@@ -739,11 +764,18 @@ async def get_agent(env: AgentEnv, call_request: CallRequest):
                 async for ev_out in run_escalation_flow(
                     call_id=call_id,
                     caller_number=caller_number,
+                    # Neutral first sentence so the announcement reads
+                    # coherently whether we then go straight into the
+                    # probe ("connecting you to our team") OR into the
+                    # queue path ("you're #N in line"). The old wording
+                    # ("Sure — one moment, connecting you to our team")
+                    # promised a transfer that wouldn't happen when the
+                    # caller landed in queue.
                     spoken_announcement=(
                         "Sure — let me grab your details so someone can "
                         "follow up on the next business day. One sec."
                         if after_hours
-                        else "Sure — one moment, connecting you to our team."
+                        else "Let me check on that for you — one moment."
                     ),
                     intent_summary=(
                         f"Caller explicitly asked for a human "
