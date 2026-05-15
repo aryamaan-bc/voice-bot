@@ -120,14 +120,14 @@ When `QUEUE_ENABLED=true` (gated behind a feature flag during burn-in), a
 new `queue_wait` phase sits between "FAQ" and "transferred". Customers who
 escalate while both reps are busy hold in a silent-hold queue with
 position updates instead of dropping straight to callback intake. The
-implementation lives in `queue.py` (new module, slice 3) + a `phase` field
+implementation lives in `hold_queue.py` (new module, slice 3) + a `phase` field
 on `escalation_status` replacing the existing boolean `in_progress` (slice
 2). Plan file: `~/.claude/plans/crystalline-sleeping-aho.md`.
 
 The three new invariants to preserve when working on queue code:
 
 - **Case 10: Hangup during queue wait** — the `CallEnded` handler must
-  call `queue.dequeue(call_id)` AND log `outcome="abandoned_in_queue"`
+  call `hold_queue.dequeue(call_id)` AND log `outcome="abandoned_in_queue"`
   (not generic `abandoned`). Without the dequeue, a phantom entry blocks
   subsequent customers' position advancement.
 

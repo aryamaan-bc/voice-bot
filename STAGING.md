@@ -50,7 +50,7 @@ Plan file: `~/.claude/plans/crystalline-sleeping-aho.md`. Slice order:
 1. **Slice 0** — Docs + prompt updates (CLAUDE.md, README.md, system prompt). Zero runtime risk. Start here.
 2. **Slice 1** — Add `queue_waiting` + `abandoned_in_queue` to `linear_ticket.py`'s `Outcome` literal. Tiny, no callers yet.
 3. **Slice 2** — Refactor `escalation_status["in_progress"]: bool` → `phase: str` enum. Pure refactor; every existing guard migrated atomically (Case 8/9, record_followup, end_call_with_goodbye).
-4. **Slice 3** — `queue.py` with `_QUEUE`, `_QUEUE_LOCK`, `_ACTIVE_PROBES`, shared poller. Not wired yet.
+4. **Slice 3** — `hold_queue.py` with `_QUEUE`, `_QUEUE_LOCK`, `_ACTIVE_PROBES`, shared poller. Not wired yet. (Module name avoids shadowing the Python stdlib `queue` module.)
 5. **Slice 4** — Queue admission + silent hold + dispatch. Gated by `QUEUE_ENABLED=true` in `.env.staging`.
 6. **Slice 5** — Graceful shutdown handler (atexit best-effort flush).
 7. **Slice 6** — Per-call conference suffix to avoid same-caller redial collisions.
