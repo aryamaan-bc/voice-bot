@@ -35,6 +35,20 @@ exports.handler = (context, event, callback) => {
   const action  = `https://${context.DOMAIN_NAME}/queue-action?${baseParams}`;
 
   const twiml = new Twilio.twiml.VoiceResponse();
+
+  // Pre-queue announcement: tells the caller they're being held, sets
+  // expectations for hold music, AND surfaces the press-1 callback
+  // option from the very first second of the queue. Without this the
+  // caller didn't know press-1 was an option until ~3 min into the
+  // wait (when /queue-wait's press-1 prompt previously kicked in).
+  // Polly voice — Twilio doesn't have Cartesia's voice, so the change
+  // from Cartesia → Polly is the audio cue that the call has crossed
+  // from Cartesia to Twilio.
+  twiml.say(
+    { voice: 'Polly.Joanna' },
+    'Putting you on hold for our team. You can press 1 anytime to leave a callback message, or stay on the line.'
+  );
+
   twiml.enqueue(
     { waitUrl, waitMethod: 'POST', action, method: 'POST' },
     queueName
