@@ -21,27 +21,51 @@ Set up 2026-05-15. Lives in parallel with production; no shared mutable state.
 
 **Done:**
 - New Cartesia agent created and bought number imported
-- Standalone Twilio Functions service deployed (4 functions + 1 asset, identical to local source)
+- Standalone Twilio Functions service deployed. Current state: **13
+  Functions + 3 Assets** (grew from 4 + 1 as the v2/v2.1/v2.2/v2.4
+  slices landed). Inventory:
+  - Functions: `conference-status`, `dashboard-state`,
+    `queue-callback-saved`, `queue-after-record`, `queue-press`,
+    `queue-leave`, `queue-action`, `queue-wait`, `enqueue-customer`,
+    `agent-dial`, `agent-token`, `recording-callback`, `conference-join`
+  - Assets: `agent-pickup.html`, `dashboard.html`, `classic-60s.mp3`
 - TwiML App for browser pickup created, pointed at staging `/agent-dial`
 - New API Key for staging Voice SDK token signing
 - 4 environment variables set on the staging Functions service
-- All staging endpoints smoke-tested and working
+  (`TWILIO_QUEUE_NAME`, `MAX_QUEUE_WAIT_SECONDS`, `LINEAR_API_KEY`,
+  `LINEAR_TEAM_ID`) plus `SLACK_WEBHOOK_URL` for recording-callback
+- Twilio Sync default service in use for `bc-call-intent` Map (auto-
+  created on first `/enqueue-customer` write)
+- All staging endpoints smoke-tested and working end-to-end through
+  the press-1 voicemail flow.
 
-**Pending (next session picks up here):**
-- Save `.env.staging` somewhere outside the worktree (or at `.env.staging.local` to match the gitignore pattern). Contents are in the prior session's transcript.
-- `cartesia env set --from=<path> --agent-id=agent_sxQV2ZUGSBN8KY8uQKsSr2`
-- `cartesia deploy --agent-id=agent_sxQV2ZUGSBN8KY8uQKsSr2`
-- Dial `+1 (572) 218-0660` and verify the bot answers.
+## Drift vs production (substantial — addressed by PROD_DEPLOY.md)
 
-## Drift surfaced during setup (separate follow-up, not blocking queue work)
+As of the v2.4 + intent-on-dashboard work, staging has **9 Functions
+and 2 Assets that don't exist on prod at all**, plus modifications to
+4 prod files. Prod has only the 5 original Functions
+(`agent-dial`, `agent-token`, `recording-callback`, `conference-join`,
+`probe-accept`) + 1 Asset (`agent-pickup.html`).
 
-The Twilio Functions hosted on prod's `bc-voice-functions-8157.twil.io` are STALE compared to local `twilio_functions/*` files. Specifically:
-- `agent-pickup.html` — prod is missing the urgent-banner styles and `.caller` info panel. Case 6 recovery (WebRTC stall) isn't actually live in production.
-- `conference-join.js` — prod is missing the `?conf=` query param handling and the Twilio API caller-ID fallback (commit e361236's per-call conference work).
-- `recording-callback.js` — prod is missing the `event.customer` handling for caller-number Slack DMs (commit ded7f6e).
-- `agent-token.js`, `agent-dial.js` — identical local vs prod.
+Net prod-side changes when PROD_DEPLOY.md is executed:
+- **9 new Functions to create**: `enqueue-customer`, `queue-wait`,
+  `queue-action`, `queue-press`, `queue-after-record`,
+  `queue-callback-saved`, `queue-leave`, `conference-status`,
+  `dashboard-state`
+- **2 new Assets to upload**: `dashboard.html`, `classic-60s.mp3`
+- **3 modified Functions**: `agent-dial`, `recording-callback`,
+  `conference-join`
+- **1 modified Asset**: `agent-pickup.html`
+- **1 unchanged on both sides**: `agent-token`, `probe-accept`
 
-Staging is deployed FROM the local files, so staging has all these features. After queue burn-in, the local files should be synced to prod's hosted Functions service. **Track this as a separate task; do not bundle with queue work.**
+`probe-accept` is a v1-only Function that staging never imported. It
+should stay deployed on prod (rollback path for `QUEUE_VERSION=v1`)
+but its source isn't in `twilio_functions/`. If `QUEUE_VERSION=v1` is
+ever flipped on prod, that Function continues to serve from its
+existing prod version.
+
+**This drift is intentional** and gets resolved by following
+`PROD_DEPLOY.md`. It is not a follow-up task — it IS the rollout.
 
 ## Phased rollout (from the plan)
 
@@ -63,16 +87,22 @@ User feedback after v1 staging burn-in: callers expect real hold music, not sile
 
 v1 is **not deleted** — `QUEUE_VERSION` env var (default `v2` after rollout) selects which implementation runs. Rollback = `QUEUE_VERSION=v1` + `cartesia env set` (no code redeploy).
 
-| Slice | Files | What changes |
-|-------|-------|--------------|
-| v2-0 | CLAUDE.md, README.md, STAGING.md | Doc updates: v2 architecture + QUEUE_VERSION rollback. Zero runtime change. **(this slice)** |
-| v2-1 | `twilio_functions/enqueue-customer.js`, `queue-wait.js`, `queue-action.js`, `queue-press.js`, `queue-after-record.js`, `queue-callback-saved.js` (all NEW) | Deploy 6 new Twilio Functions. Chained voicemail→gather flow → one consolidated Slack DM. |
-| v2-2 | `agent-dial.js`, `agent-pickup.html`, `recording-callback.js` (MODIFIED) | Add `mode=queue` branch. Backward-compatible. |
-| v2-3 | `linear_ticket.py` | Add `voicemail_logged` outcome. |
-| v2-4 | `escalation.py`, `main.py`, `slack_ticket.py` | Wire v2 alongside v1, gated by `QUEUE_VERSION`. v1 code preserved untouched. |
-| v2-6 | `.env.staging.local`, staging Functions service env | Set `QUEUE_VERSION`, `TWILIO_QUEUE_NAME`, `HOLD_MUSIC_URL`, `MAX_QUEUE_WAIT_SECONDS`, `LINEAR_API_KEY`, `LINEAR_TEAM_ID` on Functions. Push Cartesia env. Deploy. |
-| v2-7 | (manual) | Burn-in: 8 test cases from the plan (verifies both `v2` happy path AND `QUEUE_VERSION=v1` rollback). |
-| v2-8 | prod `.env` | After burn-in: mirror Functions to prod service, set `QUEUE_ENABLED=true` on prod, deploy. |
+| Slice | Files | What changes | Status |
+|-------|-------|--------------|--------|
+| v2-0 | CLAUDE.md, README.md, STAGING.md | Doc updates: v2 architecture + QUEUE_VERSION rollback. Zero runtime change. | Done |
+| v2-1 | 6 NEW Functions (`enqueue-customer`, `queue-wait`, `queue-action`, `queue-press`, `queue-after-record`, `queue-callback-saved`) | Deploy 6 new Twilio Functions. Chained voicemail→gather flow → one consolidated Slack DM. | Done |
+| v2-2 | `agent-dial.js`, `agent-pickup.html`, `recording-callback.js` (MODIFIED) | Add `mode=queue` branch. Backward-compatible. | Done |
+| v2-3 | `linear_ticket.py` | Add `voicemail_logged` outcome. | Done |
+| v2-4 | `escalation.py`, `main.py`, `slack_ticket.py` | Wire v2 alongside v1, gated by `QUEUE_VERSION`. v1 code preserved untouched. | Done |
+| v2-6 | `.env.staging.local`, staging Functions service env | Set queue env vars, push Cartesia env, deploy. | Done |
+| v2-7 | (manual) | Initial burn-in. Hit live music URL crash, Rick Astley file, voicemail flow bugs — all fixed. | Done |
+| **v2.1** | `agent-dial.js`, `conference-join.js` | Conference-on-bridge: rep dequeues into per-call `bc-active-<id>` conference. Multiple reps can join the same active call. | Done |
+| **v2.2** | NEW `dashboard-state.js` + `dashboard.html`; modified `escalation.py`, `agent-dial.js` Slack DMs | Rep dashboard replaces noisy per-caller Slack DMs. Polls JSON state every 5s. | Done |
+| **v2.3** | `agent-pickup.html` | Mute button (`call.mute(bool)` from Voice JS SDK). | Done |
+| **v2.4** | NEW `conference-status.js`; modified `conference-join.js` | Auto-hangup: if the only rep leaves the conference, customer hears 30s grace period then a goodbye + hangup. | Done |
+| **Intent on dashboard** | `enqueue-customer.js` (Sync write), `dashboard-state.js` (Sync read), `dashboard.html` (render) | Twilio Sync Map `bc-call-intent` keyed by CallSid. Dashboard shows "Wants: …" under each card. | Done |
+| **Voicemail flow polish** | NEW `queue-leave.js`; modified `queue-wait.js`, `queue-press.js` | Press-1 now does `<Leave/>` first so the caller actually exits the queue before the recording flow starts (was looping back to position updates mid-voicemail). Prompt no longer invites hangup. | Done |
+| v2-8 | prod | Mirror Functions + Assets + env to prod, set `QUEUE_ENABLED=true` on prod. See PROD_DEPLOY.md. | Pending |
 
 Slice v2-5 (delete v1 code) is intentionally **skipped** — v1 stays as the rollback path until v2 has weeks of solid burn-in. Cleanup happens in a separate later PR.
 

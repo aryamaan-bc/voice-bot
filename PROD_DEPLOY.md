@@ -5,14 +5,28 @@ touches production. Many steps are irreversible without manual cleanup
 or work to roll back. Each phase has explicit verification steps and a
 rollback path; do not skip them.
 
-The goal: bring the queue-v1 branch's v2 hold-queue work (Twilio
-Enqueue with hold music + position updates + press-1 voicemail intake)
-to the production Cartesia agent (`agent_CicivQhXS56dgUehm3B1Ea`,
+The goal: bring the queue-v1 branch's v2 hold-queue work to the
+production Cartesia agent (`agent_CicivQhXS56dgUehm3B1Ea`,
 `+1 (888) 460-4901`) and the production Twilio Functions service
 (`ZSe76103f244f13fa11a0276e282f87b3b`, `bc-voice-functions-8157.twil.io`).
 Staging (`agent_sxQV2ZUGSBN8KY8uQKsSr2`, `+1 (572) 218-0660`,
 `ZSac4ea69969563d790da8d975a76b969c`) is the reference — staging works
-end-to-end as of commit `e23a4f3`.
+end-to-end as of the latest commit on `queue-v1`.
+
+What's bundled in this deploy (everything that landed on queue-v1):
+- **v2 queue**: Twilio Enqueue with hold music (Chopin Asset) + position
+  updates + press-1 voicemail intake
+- **v2.1 conference-on-bridge**: reps dequeue into per-call conferences
+  named `bc-active-<id>` so a second rep can join the same call
+- **v2.2 rep dashboard** (`/dashboard.html`): live queue + active-call
+  view, polling `/dashboard-state` JSON every 5s. Slack DMs reduced to
+  notifications-only with a "Open Rep Dashboard" link.
+- **v2.3 mute button** on rep pickup page
+- **v2.4 auto-hangup**: customer hears a 30s wind-down + hangup if the
+  only rep on the conference drops (`/conference-status` Function)
+- **Caller intent on dashboard**: Twilio Sync Map (`bc-call-intent`)
+  keyed by Twilio CallSid; populated by `/enqueue-customer`, read by
+  `/dashboard-state`, rendered as "Wants: …" on each card
 
 **Estimated time:** 30-45 minutes of attentive work. Plan to be at the
 keyboard the whole time; do not start during peak call hours.
@@ -50,29 +64,29 @@ keyboard the whole time; do not start during peak call hours.
 
 ## Drift warning before you start
 
-The prod Functions service is **stale relative to local** — three
-Functions have unsynced changes from earlier work (per STAGING.md
-"Drift surfaced during setup" section). The local versions on the
-queue-v1 branch incorporate:
-- `agent-pickup.html` — adds `.caller` info panel + `.fallback.urgent`
-  red-banner styles + Case 6 watchdog UI + new `mode=queue` UI
-- `conference-join.js` — adds `?conf=` query param handling + Twilio
-  API caller-ID fallback
-- `recording-callback.js` — adds `event.customer` handling for Slack
-  DM + new `type=queue_bridged` template
-- `agent-dial.js` — adds `mode=queue` branch for v2 queue dispatch
+The prod Functions service is **stale relative to local**. The
+queue-v1 branch contains both the original v2 work AND the v2.1/v2.2/
+v2.4 layers and intent-on-dashboard. The following files on prod will
+be overwritten:
 
-**Uploading the new versions will overwrite prod's stale versions with
-the up-to-date local versions.** Effects on existing v1 behavior:
-- Pre-existing browser pickup flow: still works. The new code adds
-  conditional branches (`if mode === "queue"`); the default unset
-  case keeps v1 conference behavior identical.
-- Conference recording Slack DM: now mentions the customer's number
-  (was missing on stale prod). Improvement, not regression.
-- Browser pickup page: now shows the urgent red banner if WebRTC hangs
-  10s + caller info. Improvement.
+- `agent-pickup.html` — adds info panel, urgent red banner, queue
+  mode, conference mode, **mute button**
+- `conference-join.js` — adds `?conf=` query handling, Twilio API
+  caller-ID fallback, **conference `statusCallback` wired to
+  `/conference-status`** (required for v2.4 auto-hangup)
+- `recording-callback.js` — adds customer-number Slack DM + new
+  `type=queue_bridged` template
+- `agent-dial.js` — adds `mode=queue` AND `mode=conference` branches;
+  `mode=queue` now dequeues into a `bc-active-<id>` conference (NOT a
+  direct bridge), and posts the "active call" Slack notification
 
-You will land all three improvements as a side effect of this deploy.
+**Uploading the new versions overwrites prod's stale versions with the
+queue-v1 versions.** Effect on existing v1 behavior:
+- Default unset/`mode=conference` path keeps v1 conference behavior
+  identical (modulo the customer-number Slack DM improvement).
+- Pre-existing browser pickup flow still works.
+
+You will land those improvements as a side effect of this deploy.
 
 ---
 
@@ -215,20 +229,40 @@ done
 
 **Verify:** all four should show ZV-prefixed SIDs, not error messages.
 
-Note: `HOLD_MUSIC_URL` is intentionally NOT set — the queue-wait.js
-fallback `https://demo.twilio.com/docs/classic.mp3` (verified working)
-plays when this env var is absent.
+Note: `HOLD_MUSIC_URL` is intentionally NOT set — `queue-wait.js`
+falls back to the `/classic-60s.mp3` Asset (Chopin clip, uploaded in
+Phase 2.3.5) when the env var is absent.
 
-### 2.2 — Upload the 6 NEW Functions
+### 2.1.1 — Verify Twilio Sync default service is enabled
 
-These don't exist on prod yet, so we create each Function resource +
-upload its first Version.
+The caller-intent integration writes to the **default** Twilio Sync
+Service. This service is auto-created on first use and is enabled on
+all standard Twilio accounts by default. Verify:
+
+```bash
+curl -s -u "$TWILIO_ACCOUNT_SID:$TWILIO_AUTH_TOKEN" \
+  "https://sync.twilio.com/v1/Services/default" \
+  | python3 -c "import json,sys;d=json.load(sys.stdin);print('sid:',d.get('sid'),'name:',d.get('friendly_name'))"
+```
+
+**Expected:** prints a `IS…` SID and a friendly name. If you get a 404,
+the account doesn't have Sync provisioned — open a ticket with Twilio
+before continuing. The `bc-call-intent` Map gets auto-created by
+`/enqueue-customer` on the first queued call.
+
+### 2.2 — Upload the 9 NEW Functions
+
+These don't exist on prod yet. The 6 v2 queue Functions plus
+`queue-leave` (press-1 exit helper), `conference-status` (v2.4
+auto-hangup), and `dashboard-state` (v2.2 JSON state endpoint).
 
 ```bash
 cd /Users/aryamaanlakhotia/Downloads/voice-bot1
 mkdir -p /tmp/prod_fn_versions
 > /tmp/prod_fn_versions/new.txt
-for NAME in enqueue-customer queue-wait queue-action queue-press queue-after-record queue-callback-saved; do
+for NAME in enqueue-customer queue-wait queue-action queue-press \
+            queue-after-record queue-callback-saved queue-leave \
+            conference-status dashboard-state; do
   echo "--- $NAME ---"
   FN_RESP=$(curl -s -u "$TWILIO_ACCOUNT_SID:$TWILIO_AUTH_TOKEN" \
     -X POST "https://serverless.twilio.com/v1/Services/$PROD_FN_SERVICE/Functions" \
@@ -244,11 +278,14 @@ for NAME in enqueue-customer queue-wait queue-action queue-press queue-after-rec
 done
 ```
 
-**Verify:** 6 ZN-prefixed version SIDs written to
-`/tmp/prod_fn_versions/new.txt`. If any errored, STOP — investigate the
-specific Function's HTTP response.
+**Verify:** 9 ZN-prefixed version SIDs written to
+`/tmp/prod_fn_versions/new.txt`. Confirm `wc -l` on the file matches 9 —
+**critical**: if `wc -l` reports 8, you're missing the trailing newline
+and a `while read` loop downstream will silently drop the last entry
+(this exact bug ate `queue-press` + `classic-60s.mp3` from a staging
+build once; symptoms are 11200 / 404 errors at runtime).
 
-### 2.3 — Upload UPDATED versions of the 3 modified existing Functions + 1 modified Asset
+### 2.3 — Upload UPDATED versions of 3 modified existing Functions + 1 modified Asset
 
 ```bash
 # agent-dial.js (FN_SID is fixed — from inventory)
@@ -267,8 +304,8 @@ NEW_REC_CB_VER=$(curl -s -u "$TWILIO_ACCOUNT_SID:$TWILIO_AUTH_TOKEN" \
   | python3 -c "import json,sys; print(json.load(sys.stdin)['sid'])")
 echo "recording-callback new ver: $NEW_REC_CB_VER"
 
-# conference-join.js (sync the stale prod version — this is the
-# unsynced commit e361236 work that STAGING.md flagged)
+# conference-join.js — includes the v2.4 statusCallback wiring needed
+# for the auto-hangup-on-rep-leave behavior.
 NEW_CJ_VER=$(curl -s -u "$TWILIO_ACCOUNT_SID:$TWILIO_AUTH_TOKEN" \
   -X POST "https://serverless-upload.twilio.com/v1/Services/$PROD_FN_SERVICE/Functions/ZHf1e1603c6f397ba3144b6eb512545148/Versions" \
   -F "Path=/conference-join" -F "Visibility=public" \
@@ -276,13 +313,45 @@ NEW_CJ_VER=$(curl -s -u "$TWILIO_ACCOUNT_SID:$TWILIO_AUTH_TOKEN" \
   | python3 -c "import json,sys; print(json.load(sys.stdin)['sid'])")
 echo "conference-join new ver: $NEW_CJ_VER"
 
-# agent-pickup.html (Asset, not Function — different endpoint)
+# agent-pickup.html (Asset — includes the v2.3 Mute button)
 NEW_PICKUP_VER=$(curl -s -u "$TWILIO_ACCOUNT_SID:$TWILIO_AUTH_TOKEN" \
   -X POST "https://serverless-upload.twilio.com/v1/Services/$PROD_FN_SERVICE/Assets/ZH147329922be542a34e16c8f6a30acbda/Versions" \
   -F "Path=/agent-pickup.html" -F "Visibility=public" \
   -F "Content=@twilio_functions/agent-pickup.html;type=text/html" \
   | python3 -c "import json,sys; print(json.load(sys.stdin)['sid'])")
 echo "agent-pickup.html new ver: $NEW_PICKUP_VER"
+```
+
+### 2.3.5 — Upload 2 NEW Assets
+
+`dashboard.html` is the v2.2 rep dashboard page. `classic-60s.mp3` is
+the ~55-second Chopin Nocturne clip used as hold music (replaces the
+demo.twilio.com URL which was returning the Rick Astley joke file).
+
+```bash
+# Create the two new Asset resources
+NEW_DASH_ASSET=$(curl -s -u "$TWILIO_ACCOUNT_SID:$TWILIO_AUTH_TOKEN" \
+  -X POST "https://serverless.twilio.com/v1/Services/$PROD_FN_SERVICE/Assets" \
+  --data-urlencode "FriendlyName=dashboard.html" \
+  | python3 -c "import json,sys;print(json.load(sys.stdin)['sid'])")
+NEW_MUSIC_ASSET=$(curl -s -u "$TWILIO_ACCOUNT_SID:$TWILIO_AUTH_TOKEN" \
+  -X POST "https://serverless.twilio.com/v1/Services/$PROD_FN_SERVICE/Assets" \
+  --data-urlencode "FriendlyName=classic-60s.mp3" \
+  | python3 -c "import json,sys;print(json.load(sys.stdin)['sid'])")
+echo "new asset SIDs: dashboard=$NEW_DASH_ASSET music=$NEW_MUSIC_ASSET"
+
+# Upload first version of each
+NEW_DASH_VER=$(curl -s -u "$TWILIO_ACCOUNT_SID:$TWILIO_AUTH_TOKEN" \
+  -X POST "https://serverless-upload.twilio.com/v1/Services/$PROD_FN_SERVICE/Assets/$NEW_DASH_ASSET/Versions" \
+  -F "Path=/dashboard.html" -F "Visibility=public" \
+  -F "Content=@twilio_functions/dashboard.html;type=text/html" \
+  | python3 -c "import json,sys;print(json.load(sys.stdin)['sid'])")
+NEW_MUSIC_VER=$(curl -s -u "$TWILIO_ACCOUNT_SID:$TWILIO_AUTH_TOKEN" \
+  -X POST "https://serverless-upload.twilio.com/v1/Services/$PROD_FN_SERVICE/Assets/$NEW_MUSIC_ASSET/Versions" \
+  -F "Path=/classic-60s.mp3" -F "Visibility=public" \
+  -F "Content=@twilio_functions/classic-60s.mp3;type=audio/mpeg" \
+  | python3 -c "import json,sys;print(json.load(sys.stdin)['sid'])")
+echo "new asset version SIDs: dash=$NEW_DASH_VER music=$NEW_MUSIC_VER"
 ```
 
 ### 2.4 — Capture latest versions for the 2 UNCHANGED functions
@@ -305,25 +374,29 @@ echo "probe-accept (unchanged) latest ver: $LATEST_PROBE_VER"
 ### 2.5 — Create Build + Deployment
 
 Build needs:
-- 6 NEW Function versions (from 2.2)
+- 9 NEW Function versions (from 2.2)
 - 3 MODIFIED Function versions (from 2.3)
 - 2 UNCHANGED Function versions (from 2.4)
-- 1 MODIFIED Asset version (from 2.3)
+- 1 MODIFIED Asset version (`agent-pickup.html`, from 2.3)
+- 2 NEW Asset versions (`dashboard.html`, `classic-60s.mp3`, from 2.3.5)
 
 ```bash
-# Combine all 11 Function versions (6 new from /tmp/prod_fn_versions/new.txt +
-# 3 modified + 2 unchanged)
-NEW_VERS=$(cat /tmp/prod_fn_versions/new.txt | xargs)
+# Combine all 14 Function versions
+NEW_VERS=$(cat /tmp/prod_fn_versions/new.txt | xargs)  # 9 new
 ALL_FUNC_VERS="$NEW_VERS $NEW_AGENT_DIAL_VER $NEW_REC_CB_VER $NEW_CJ_VER $LATEST_AGENT_TOKEN_VER $LATEST_PROBE_VER"
+
+# Sanity: count tokens. MUST be 14.
+echo "func count: $(echo $ALL_FUNC_VERS | wc -w)"
+echo "asset count: 3 (pickup=$NEW_PICKUP_VER, dash=$NEW_DASH_VER, music=$NEW_MUSIC_VER)"
 
 # Build the curl flags
 FN_FLAGS=""
 for V in $ALL_FUNC_VERS; do FN_FLAGS="$FN_FLAGS -d FunctionVersions=$V"; done
+AST_FLAGS="-d AssetVersions=$NEW_PICKUP_VER -d AssetVersions=$NEW_DASH_VER -d AssetVersions=$NEW_MUSIC_VER"
 
 BUILD_RESP=$(curl -s -u "$TWILIO_ACCOUNT_SID:$TWILIO_AUTH_TOKEN" \
   -X POST "https://serverless.twilio.com/v1/Services/$PROD_FN_SERVICE/Builds" \
-  $FN_FLAGS \
-  -d "AssetVersions=$NEW_PICKUP_VER" \
+  $FN_FLAGS $AST_FLAGS \
   --data-urlencode 'Dependencies=[{"name":"@twilio/runtime-handler","version":"2.0.3"},{"name":"twilio","version":"5.0.3"},{"name":"xmldom","version":"0.6.0"},{"name":"lodash","version":"4.17.21"},{"name":"util","version":"0.12.5"}]')
 PROD_BUILD_SID=$(echo "$BUILD_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('sid','ERR'))")
 echo "PROD_BUILD_SID=$PROD_BUILD_SID"
@@ -333,7 +406,20 @@ until curl -s -u "$TWILIO_ACCOUNT_SID:$TWILIO_AUTH_TOKEN" \
   "https://serverless.twilio.com/v1/Services/$PROD_FN_SERVICE/Builds/$PROD_BUILD_SID/Status" \
   | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['status']); exit(0 if d['status'] in ('completed','failed') else 1)" 2>/dev/null; do sleep 3; done
 
-# Deploy the build to the prod environment
+# CRITICAL: verify the build manifest before deploying. Counts MUST be
+# 14 functions + 3 assets. If any are missing, the build is bad and
+# deploying will cause 11200 application errors at runtime.
+curl -s -u "$TWILIO_ACCOUNT_SID:$TWILIO_AUTH_TOKEN" \
+  "https://serverless.twilio.com/v1/Services/$PROD_FN_SERVICE/Builds/$PROD_BUILD_SID" \
+  | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+print('fn paths:', sorted(f['path'] for f in d['function_versions']))
+print('ast paths:', sorted(a['path'] for a in d['asset_versions']))
+print('counts: fn=', len(d['function_versions']), 'ast=', len(d['asset_versions']))
+"
+
+# STOP HERE if counts are wrong. Otherwise deploy:
 curl -s -u "$TWILIO_ACCOUNT_SID:$TWILIO_AUTH_TOKEN" \
   -X POST "https://serverless.twilio.com/v1/Services/$PROD_FN_SERVICE/Environments/$PROD_ENV_SID/Deployments" \
   --data-urlencode "BuildSid=$PROD_BUILD_SID" \
@@ -343,10 +429,14 @@ curl -s -u "$TWILIO_ACCOUNT_SID:$TWILIO_AUTH_TOKEN" \
 **STOP if Build status is `failed`** — query the Build resource for
 errors and investigate before deploying.
 
+**STOP if the manifest sanity check shows <14 fn or <3 ast** — a
+missing version causes a 404 on the live domain and Twilio plays
+"application error has occurred" to live callers.
+
 ### 2.6 — Smoke-test prod Functions endpoints
 
-Test each new endpoint returns valid TwiML. **No real call yet** —
-just curl the prod Functions domain directly.
+Test each new endpoint returns valid TwiML/JSON/HTML. **No real call
+yet** — just curl the prod Functions domain directly.
 
 ```bash
 DOMAIN=bc-voice-functions-8157.twil.io
@@ -362,11 +452,27 @@ echo "--- /queue-wait at QueueTime=1000 (hard-timeout — should return Leave) -
 curl -s -X POST "https://$DOMAIN/queue-wait?call_id=t&caller=%2B1&intent=t" \
   --data-urlencode "QueueTime=1000" --data-urlencode "QueuePosition=1" | head -3
 
+echo "--- /queue-leave (press-1 helper) ---"
+curl -s -X POST "https://$DOMAIN/queue-leave" | head -3
+
+echo "--- /conference-status (no-op for non-leave events) ---"
+curl -s -X POST "https://$DOMAIN/conference-status" \
+  --data-urlencode "StatusCallbackEvent=start"
+
 echo "--- /agent-dial mode=queue ---"
 curl -s -X POST "https://$DOMAIN/agent-dial" --data-urlencode "mode=queue" | head -3
 
 echo "--- /agent-dial conference=test (LEGACY — must still work) ---"
 curl -s -X POST "https://$DOMAIN/agent-dial" --data-urlencode "conference=bc-test-99" | head -3
+
+echo "--- /dashboard-state (JSON) ---"
+curl -s "https://$DOMAIN/dashboard-state" | head -5
+
+echo "--- /dashboard.html ---"
+curl -s -o /dev/null -w "HTTP %{http_code}\n" "https://$DOMAIN/dashboard.html"
+
+echo "--- /classic-60s.mp3 (hold music) ---"
+curl -s -o /dev/null -w "HTTP %{http_code}\n" "https://$DOMAIN/classic-60s.mp3"
 
 echo "--- /agent-pickup.html?mode=queue ---"
 curl -s -o /dev/null -w "HTTP %{http_code}\n" "https://$DOMAIN/agent-pickup.html?mode=queue"
@@ -379,8 +485,13 @@ curl -s -o /dev/null -w "HTTP %{http_code}\n" "https://$DOMAIN/agent-pickup.html
 - `/enqueue-customer` → `<Say>` + `<Enqueue waitUrlMethod=...>bc-support</Enqueue>`
 - `/queue-wait` at t=0 → `<Gather input="dtmf">` with Say + Play
 - `/queue-wait` at t=1000 → `<Leave/>`
-- `/agent-dial` with mode=queue → `<Dial record=...><Queue>bc-support</Queue></Dial>`
+- `/queue-leave` → `<Leave/>`
+- `/conference-status` → empty body (200 — no-op for non-leave events)
+- `/agent-dial` with mode=queue → `<Dial><Queue>bc-support</Queue></Dial>`
 - `/agent-dial` with conference=... → `<Dial><Conference>bc-test-99</Conference></Dial>` (legacy v1 still works)
+- `/dashboard-state` → JSON with `fetchedAt`, `queue: []`, `activeCalls: []`
+- `/dashboard.html` → HTTP 200
+- `/classic-60s.mp3` → HTTP 200 (audio/mpeg)
 - Both `/agent-pickup.html` paths → HTTP 200
 
 **STOP if anything returns 500 or unexpected XML.** Twilio Functions
@@ -403,9 +514,11 @@ curl -s -u "$TWILIO_ACCOUNT_SID:$TWILIO_AUTH_TOKEN" \
   --data-urlencode "BuildSid=ZB_OLD_BUILD_SID"
 ```
 
-The new Functions (enqueue-customer etc.) won't physically be deleted,
-but the build pointed at will no longer route to them. The original 5
-prod functions return to their pre-deploy versions.
+The new Functions (enqueue-customer, queue-*, conference-status,
+dashboard-state) won't physically be deleted, but the build pointed at
+will no longer route to them. The original 5 prod functions return to
+their pre-deploy versions, and the new endpoints return 404 — which is
+fine because Cartesia code with `QUEUE_ENABLED=false` never hits them.
 
 ---
 
@@ -611,33 +724,50 @@ the new pinned version is Ready (~30-60s).
 
 ### 7.3 — Test call (v2 path active)
 
-Dial `+1 (888) 460-4901`:
+Open `https://bc-voice-functions-8157.twil.io/dashboard.html` in a
+browser tab first — you'll watch the queue/active-call view in real
+time as the test progresses. Then dial `+1 (888) 460-4901`:
 
 - [ ] FAQ greeting unchanged
 - [ ] Ask for a human →
-- [ ] Cartesia voice: "Transferring you to our team now — you'll hear
-      our hold music in just a moment." (v2 hardcoded announcement)
-- [ ] ~3 seconds silence
-- [ ] Polly voice: "Putting you on hold. Stay on the line — or press 1
-      anytime to leave a message instead."
-- [ ] Classical hold music starts
-- [ ] Slack DM lands in `#bc_customer_calls` with **"Take next caller"**
-      button (NOT "Take call from +1xxx" — that's v1 wording)
-- [ ] Rep clicks → bridged to caller via `<Dial><Queue>bc-support</Queue>`
+- [ ] Cartesia voice: "One moment — transferring you now."
+      (`V2_TRANSFER_ANNOUNCEMENT`)
+- [ ] ~3 seconds silence (REST `call.update` redirecting to /enqueue-customer)
+- [ ] Polly voice: "You're on hold for our team. Press 1 anytime to
+      leave a callback message, or stay on the line."
+- [ ] Chopin hold music starts (from `/classic-60s.mp3`)
+- [ ] Polly: "You're number 1 in line — thanks for holding." (per-cycle
+      position update; ~every minute)
+- [ ] **Dashboard tab** shows the caller in the queue card with
+      "Wants: …" line populated from the Twilio Sync Map
+- [ ] Slack DM lands in `#bc_customer_calls` with **"Open Rep Dashboard"**
+      button (no longer per-caller pickup buttons)
+- [ ] Click "Take next caller" on the dashboard → new tab opens
+      pickup page → click Join → bridged into a `bc-active-<id>`
+      conference with the caller
+- [ ] **Dashboard tab** auto-updates: queue card disappears, active-call
+      card appears showing the caller, conference name, and the same
+      "Wants: …" intent line
+- [ ] When call ends, a Slack DM lands with the recording link
 
-### 7.4 — Test press-1
+### 7.4 — Test press-1 voicemail
 
 Place a test call, get to the music, **press 1 on your keypad**:
 
-- [ ] Polly: "Sure — leave a message after the tone..."
-- [ ] Record a 5-10s message, press # (or hang up)
-- [ ] Polly: "Got it. Now please enter your callback number..."
+- [ ] Polly: "Leave your message after the tone, then press pound to
+      continue."
+- [ ] Tone plays; record a 5-10s message; press `#`
+- [ ] Polly: "Now enter your callback number, starting with area code,
+      then press pound."
 - [ ] Enter `5551234567#` on the keypad
-- [ ] Polly: "Thanks — we'll get back to you as soon as we can."
+- [ ] Polly: "Thanks — we'll get back to you as soon as we can." (or
+      similar from queue-callback-saved.js)
 - [ ] Call ends
 - [ ] **ONE consolidated Slack DM** lands in `#bc_customer_calls` with
       both the voicemail audio link AND the callback number
 - [ ] **ONE Linear ticket** lands with `outcome=voicemail_logged`
+- [ ] No re-entry into the queue position update mid-voicemail (the
+      `<Leave/>` hop in queue-leave.js is what guarantees this)
 
 ### 7.5 — Test queue-depth-2
 
@@ -648,15 +778,32 @@ second time from another device:
 - [ ] Second caller hears Polly: "You're number 1 in line — thanks for
       holding." (Twilio queue serializes — first caller is now bridged
       to rep, second is at position 1)
-- [ ] (If you can manage a third concurrent: third caller hears
-      "You're number 2 in line.")
+- [ ] Dashboard shows position 1 caller in queue card with the
+      "Behind them in line:" list populated if there's a third
 - [ ] When the rep on the bridged call hangs up, another rep can click
       "Take next caller" → bridges to the next in queue
 
-### 7.6 — Verify no Twilio errors
+### 7.6 — Test v2.4 auto-hangup on rep-leave
+
+While still on the active call from 7.3, the rep should hang up first
+(close the pickup browser tab or click Hang up). The customer should:
+
+- [ ] Hear Polly: "Looks like the rep had to step away for a moment.
+      Hang tight while I check."
+- [ ] 30 seconds of silence
+- [ ] Polly: "Sorry, I couldn't reconnect you to the rep. We'll follow
+      up with you. Goodbye."
+- [ ] Call ends cleanly
+
+If a second rep clicks "Join this call" during the 30s grace period,
+they land in an empty conference (the customer's TwiML has changed by
+that point — known edge case, see CLAUDE.md "Trade-off" note in
+conference-status.js).
+
+### 7.7 — Verify no Twilio errors
 
 Same alerts check as Phase 6.2. No new 11200 / 12200 / 12300 after the
-v2 test call.
+v2 test calls.
 
 ---
 
@@ -689,18 +836,21 @@ entirely, returns to the pre-queue probe-based flow.
 
 ## Cleanup / things to track post-deploy
 
-- **Custom hold music** — replace the Twilio-default classical track
-  with a branded MP3. Upload as an Asset to the prod Functions service;
-  set `HOLD_MUSIC_URL` env var to the asset URL. Out of scope for this
-  initial rollout.
-
 - **Twilio signature validation** on Functions — pre-existing gap.
-  Worth fixing in a separate hardening pass.
+  Worth fixing in a separate hardening pass. Public Asset URLs
+  (dashboard, pickup) are URL-obscurity-only; if either leaks, anyone
+  could read live queue/active-call state. Acceptable for staging
+  burn-in, real concern for prod.
 
 - **The duplicate escalate_to_human race** — Haiku sometimes emits the
-  tool twice in one turn. Defended-against by the phase guard in v2,
+  tool twice in one turn. Defended against by the phase guard in v2,
   but a tighter atomic check-and-set would eliminate the race. Track
   separately.
+
+- **Hold music variety** — `/classic-60s.mp3` is a single ~55s clip
+  that restarts (not resumes) every cycle. Long waits sound looped.
+  Mitigation: upload a small rotation of clips and have queue-wait.js
+  pick one round-robin. Low priority.
 
 - **Eventually delete v1 code** — after weeks of stable v2 burn-in,
   remove `hold_queue.py` + the v1 branches in `escalation.py`. Don't
@@ -726,14 +876,17 @@ entirely, returns to the pre-queue probe-based flow.
 - [ ] Phase 0.2: prior pinned version SID written down
 - [ ] Phase 1: git merge queue-v1 → main succeeds, no conflicts
 - [ ] Phase 2.1: 4 new env vars on prod Functions service
-- [ ] Phase 2.2: 6 new Functions uploaded (version SIDs captured)
-- [ ] Phase 2.3: 3 Functions + 1 Asset updated (version SIDs captured)
-- [ ] Phase 2.5: Build + Deploy successful on prod Functions service
-- [ ] Phase 2.6: all 7 smoke-test endpoints return expected TwiML
+- [ ] Phase 2.1.1: Twilio Sync default service confirmed enabled
+- [ ] Phase 2.2: 9 new Functions uploaded (version SIDs captured)
+- [ ] Phase 2.3: 3 Functions + 1 Asset updated
+- [ ] Phase 2.3.5: 2 new Assets (dashboard.html, classic-60s.mp3) uploaded
+- [ ] Phase 2.5: Build manifest verified (14 fn + 3 ast), Build + Deploy successful
+- [ ] Phase 2.6: all smoke-test endpoints return expected output
 - [ ] Phase 3: queue vars added to prod .env
 - [ ] Phase 4: env push to Cartesia successful, agent still Ready
 - [ ] Phase 5: code deploy to Cartesia successful, all 3 regions deployed
 - [ ] Phase 6: test call with QUEUE_ENABLED=false → v1 behavior unchanged
 - [ ] Phase 7: QUEUE_ENABLED flipped to true
-- [ ] Phase 7.3-7.5: test calls confirm v2 path works end-to-end
+- [ ] Phase 7.3-7.6: test calls confirm v2 path + dashboard + voicemail
+      + auto-hangup all work end-to-end
 - [ ] Phase 8: burn-in
