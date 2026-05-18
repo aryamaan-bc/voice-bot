@@ -42,16 +42,18 @@ exports.handler = (context, event, callback) => {
   const intent = (event.intent || '').toString().slice(0, 200);
 
   const maxWait = parseInt(context.MAX_QUEUE_WAIT_SECONDS || '900', 10);
-  // Twilio-hosted hold music fallback. The old com.twilio.music.classical
-  // S3 bucket was emptied (returns 404 NoSuchKey + application/xml,
-  // which crashed <Play> with Twilio alerts 11200 + 12300). Switched to
-  // demo.twilio.com/docs/classic.mp3 — same Twilio-hosted CDN file used
-  // in Twilio's <Play> docs examples, returns audio/mpeg + HTTP 200.
-  // Override via HOLD_MUSIC_URL env var to use a branded MP3 (recommended:
-  // host as a Twilio Asset in this Functions service so the URL stays
-  // inside Twilio's CDN — future v2.1 enhancement).
-  const holdMusicUrl = (context.HOLD_MUSIC_URL || '').trim() ||
-    'https://demo.twilio.com/docs/classic.mp3';
+  // Position-update cadence — how often the caller hears "you're
+  // number N in line" while holding. Twilio re-invokes waitUrl after
+  // the nested verbs finish, so we control cadence by what we put
+  // inside <Gather>. We use <Pause length=N> instead of <Play>music
+  // because Twilio's free hosted music files are 3-5 min long, which
+  // would make each cycle 3-5 min (caller gets no updates for most
+  // of the wait). Pause is silent but gives predictable ~60s cycles.
+  // (Tracking: upload a short branded MP3 as a Twilio Asset to
+  // restore music with proper cadence — v2.3.)
+  const positionUpdateInterval = parseInt(
+    context.POSITION_UPDATE_INTERVAL_SECONDS || '60', 10
+  );
 
   const twiml = new Twilio.twiml.VoiceResponse();
 
@@ -70,11 +72,12 @@ exports.handler = (context, event, callback) => {
   const queuePressUrl =
     `/queue-press?${[qs('call_id', callId), qs('caller', caller), qs('intent', intent)].join('&')}`;
 
-  // <Gather input="dtmf"> wraps the Say + Play so the keypad is live
-  // throughout the wait. timeout=1 → after Play finishes Twilio waits
-  // 1s for digits before re-invoking waitUrl. Each cycle is roughly
-  // music_duration + 1s. Press-1 routes immediately to /queue-press
-  // (voicemail intake).
+  // <Gather input="dtmf"> wraps the Say + Pause so the keypad is live
+  // throughout the wait. timeout=1 → after the nested verbs finish,
+  // Gather waits 1s for digits before completing → Twilio re-invokes
+  // waitUrl. Each cycle is Say (~3s) + Pause (positionUpdateInterval,
+  // default 60s) + 1s = ~64s. Position update fires every cycle.
+  // Press-1 during the Pause routes immediately to /queue-press.
   const gather = twiml.gather({
     input: 'dtmf',
     numDigits: 1,
@@ -86,7 +89,7 @@ exports.handler = (context, event, callback) => {
     { voice: 'Polly.Joanna' },
     `You're number ${queuePosition} in line — thanks for holding.`
   );
-  gather.play(holdMusicUrl);
+  gather.pause({ length: positionUpdateInterval });
 
   console.log(
     `queue-wait call_id=${callId} pos=${queuePosition} elapsed=${queueTime}s`

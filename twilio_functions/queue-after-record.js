@@ -45,18 +45,20 @@ exports.handler = (context, event, callback) => {
   const savedUrl = `/queue-callback-saved?${savedParams}`;
 
   const twiml = new Twilio.twiml.VoiceResponse();
+  // Single prompt — previously had a nested <Say> inside <Gather> which
+  // caused Twilio to speak the prompt twice back-to-back. Just one Say
+  // outside the Gather, then Gather listens silently for digits.
   twiml.say(
     { voice: 'Polly.Joanna' },
-    'Got it. Now please enter your callback number using the keypad, starting with area code, then press pound.'
+    'Now enter your callback number, starting with area code, then press pound.'
   );
-  const gather = twiml.gather({
+  twiml.gather({
     numDigits: 15,
     finishOnKey: '#',
     timeout: 10,
     action: savedUrl,
     method: 'POST',
   });
-  gather.say({ voice: 'Polly.Joanna' }, 'Enter your callback number, then pound.');
 
   // Fallback if Gather times out without input — still hit the final
   // handler so the voicemail audio gets logged + Slack-posted.

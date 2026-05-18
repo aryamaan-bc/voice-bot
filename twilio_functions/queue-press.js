@@ -32,10 +32,12 @@ exports.handler = (context, event, callback) => {
   const twiml = new Twilio.twiml.VoiceResponse();
   twiml.say(
     { voice: 'Polly.Joanna' },
-    'Sure — leave a message after the tone. Press pound when done, or just hang up.'
+    "Leave your message after the tone, then press pound when you're done or just hang up."
   );
   twiml.record({
     maxLength: 30,
+    timeout: 10,           // 10s of silence before stopping (was 5s default —
+                            // caller would get cut off mid-thought).
     finishOnKey: '#',
     playBeep: true,
     trim: 'trim-silence',
@@ -43,10 +45,9 @@ exports.handler = (context, event, callback) => {
     action: afterRecordUrl,
     method: 'POST',
   });
-  // If <Record> times out without any speech (rare — the caller pressed
-  // 1 then said nothing), fall through to queue-after-record anyway so
-  // the team still gets a Slack DM (with a "no audio" placeholder).
-  twiml.redirect({ method: 'POST' }, afterRecordUrl);
+  // <Record>'s action URL always fires when recording ends (hangup, #,
+  // maxLength, or silence-timeout). No need for a fallback Redirect —
+  // Twilio reliably invokes the action.
 
   callback(null, twiml);
 };
