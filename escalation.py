@@ -148,6 +148,16 @@ QUEUE_DISPATCH_TRANSITION_MESSAGE = (
     "Got a rep for you now — one moment."
 )
 
+# Spoken in the v2 handoff path RIGHT BEFORE the REST call.update moves
+# the caller's leg to Twilio. Hardcoded (not LLM-supplied) so the user
+# gets unambiguous wording every time, regardless of what Haiku chose
+# for spoken_announcement. Mentions the hold music explicitly so the
+# brief silence between Cartesia and Twilio doesn't feel like a dropped
+# call.
+V2_TRANSFER_ANNOUNCEMENT = (
+    "Transferring you to our team now — you'll hear our hold music in just a moment."
+)
+
 
 def _env(name: str, *, required: bool = True) -> str:
     val = os.environ.get(name, "")
@@ -1101,10 +1111,14 @@ async def _run_v2_queue_handoff(
     if escalation_status is not None:
         escalation_status["phase"] = "queue_handoff"
 
-    # Step 1 — announcement. Caller hears one short sentence in
-    # Cartesia's voice before being moved out to Twilio. The Twilio
-    # hold music takes over immediately after.
-    yield AgentSendText(text=spoken_announcement, interruptible=False)
+    # Step 1 — hardcoded transfer announcement. We INTENTIONALLY ignore
+    # the LLM-supplied `spoken_announcement` here because Haiku's
+    # wording varies ("Sure — one moment" / "Let me check..." / etc.)
+    # and the caller needs unambiguous "you're being transferred"
+    # framing right before the silence + music kicks in. The
+    # hardcoded text also names the hold music explicitly so the
+    # transition feels deliberate, not like a dropped call.
+    yield AgentSendText(text=V2_TRANSFER_ANNOUNCEMENT, interruptible=False)
 
     # Step 2 — Slack ping with the v2 pickup URL (?mode=queue). Button
     # opens agent-pickup.html in queue mode → click Join → TwiML App
@@ -1146,12 +1160,15 @@ async def _run_v2_queue_handoff(
     _ACTIVE_PROBE_TASKS.add(pending_task)
     pending_task.add_done_callback(_ACTIVE_PROBE_TASKS.discard)
 
-    # Step 4 — let the announcement play before we redirect (TTS finish
-    # estimate based on word count). Without this beat the REST update
-    # cuts audio mid-sentence.
-    word_count = len(spoken_announcement.split())
-    announcement_budget = min(6.0, 0.4 * word_count + 0.5)
-    await asyncio.sleep(announcement_budget)
+    # Step 4 — let the announcement play before we redirect. The
+    # V2_TRANSFER_ANNOUNCEMENT is 14 words (~5s of Cartesia TTS); we
+    # sleep just long enough for Cartesia to render most of it. Set
+    # short so the music starts ASAP after the announcement, minimizing
+    # the silent gap between Cartesia and Twilio (which previously felt
+    # like a dropped call to testers). The Twilio /enqueue-customer
+    # pre-queue Say covers any residual cut-off if the budget is too
+    # short.
+    await asyncio.sleep(3.0)
 
     # Step 5 — REST call.update. On success, Cartesia session ends
     # shortly; on failure, fall through to in-Cartesia callback intake.
