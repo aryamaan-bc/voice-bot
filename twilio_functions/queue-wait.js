@@ -5,18 +5,19 @@
  * invocation returns a finite TwiML response (~30-60s of audio); when
  * playback finishes, Twilio re-invokes this URL with updated QueueTime.
  *
- * Every TwiML response except <Leave/> has the same shape:
- *   <Gather press-1>
- *     <Say>You're number N in line. Press 1 to leave a message...</Say>
- *     <Play>hold music</Play>
- *   </Gather>
+ * Twilio's <Enqueue> waitUrl TwiML schema is restrictive: ONLY <Say>,
+ * <Play>, <Pause>, <Redirect>, <Leave> are valid. <Gather> is NOT
+ * allowed — Twilio throws "application error" if you try.
  *
- * So the caller is reminded of their position AND the press-1 option on
- * every cycle (~every minute as music segments end and Twilio re-invokes
- * waitUrl). The press-1 keypad is live throughout — pressing 1 routes
- * to /queue-press immediately. At MAX_QUEUE_WAIT_SECONDS we return
- * <Leave/>; queue-action fires with QueueResult=leave and redirects
- * the caller to /queue-press (voicemail intake).
+ * So every TwiML response (except <Leave/> at hard-timeout) is just:
+ *   <Say>You're number N in line — thanks for holding.</Say>
+ *   <Play>hold music</Play>
+ *
+ * Position update fires every cycle (~every minute as music segments
+ * end and Twilio re-invokes waitUrl). No press-1 inside the queue —
+ * the keypad can't be live in waitUrl context. The only escape from
+ * the queue (other than a rep dequeuing) is the 15-min hard-timeout
+ * <Leave/>, which routes to /queue-press (voicemail intake).
  *
  * Twilio passes these inputs:
  *   QueueTime         — seconds since the caller was enqueued
@@ -55,33 +56,13 @@ exports.handler = (context, event, callback) => {
     return callback(null, twiml);
   }
 
-  // Propagate query params so /queue-press can post a complete Slack DM.
-  const qs = (k, v) => `${k}=${encodeURIComponent(v)}`;
-  const queuePressUrl =
-    `/queue-press?${[qs('call_id', callId), qs('caller', caller), qs('intent', intent)].join('&')}`;
-
-  // <Gather> wraps everything so press-1 is always live. timeout=1 means
-  // after the nested <Play>/<Say> finishes, Gather waits 1s of silence
-  // before completing → Twilio re-invokes waitUrl. Each cycle is
-  // roughly music_duration + 1s.
-  const gather = twiml.gather({
-    numDigits: 1,
-    timeout: 1,
-    action: queuePressUrl,
-    method: 'POST',
-  });
-
-  // Speak position + press-1 reminder on EVERY invocation, including
-  // the first (QueueTime=0). The caller benefits from knowing their
-  // position immediately, and the press-1 reminder stays fresh
-  // throughout the wait. The /enqueue-customer pre-queue announcement
-  // already mentioned press-1, so the first Say here is a confirmation
-  // that the option is still available + their actual queue position.
-  gather.say(
+  // Just <Say> + <Play> — both valid waitUrl verbs per Twilio's TwiML
+  // schema. No <Gather> (would cause an application error).
+  twiml.say(
     { voice: 'Polly.Joanna' },
-    `You're number ${queuePosition} in line. Press 1 to leave a message, or stay on the line.`
+    `You're number ${queuePosition} in line — thanks for holding.`
   );
-  gather.play(holdMusicUrl);
+  twiml.play(holdMusicUrl);
 
   console.log(
     `queue-wait call_id=${callId} pos=${queuePosition} elapsed=${queueTime}s`
