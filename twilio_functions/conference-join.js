@@ -55,12 +55,22 @@ exports.handler = async function (context, event, callback) {
   // conversation isn't capped, while still bounding the orphan case.
   // Lower if you ever see customers stuck in orphan silence; raise
   // if real calls are getting auto-disconnected.
+  // Conference statusCallback so the /conference-status Function can
+  // gracefully end the customer's call if the only rep leaves (without
+  // this the customer is stranded in an empty conference until the 60-min
+  // timeLimit). Subscribes to 'leave' events only.
+  const confStatusUrl =
+    `https://${context.DOMAIN_NAME}/conference-status`;
+
   const twiml = new Twilio.twiml.VoiceResponse();
   twiml.dial({ timeLimit: 3600 }).conference(
     {
       record: 'record-from-start',
       recordingStatusCallback: callbackUrl,
       recordingStatusCallbackEvent: 'completed',
+      statusCallback: confStatusUrl,
+      statusCallbackEvent: 'leave',
+      statusCallbackMethod: 'POST',
       trim: 'trim-silence',
       beep: false,
       startConferenceOnEnter: true,
