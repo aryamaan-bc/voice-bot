@@ -131,24 +131,22 @@ exports.handler = async function (context, event, callback) {
       }
     }
 
-    // Fire the Slack "active call" message with a "Join this call"
-    // button. Non-blocking — if Slack post fails, the rep still joins
-    // the conference correctly.
+    // Fire the Slack "active call" notification. The dashboard is now
+    // the single rep action surface — this Slack DM is a passive
+    // alert with a link to the dashboard (not a direct join button).
+    // Eliminates the previous confusion where reps clicked "Join this
+    // call" thinking it was "Take next caller".
     if (context.SLACK_WEBHOOK_URL) {
-      const joinUrl =
-        `https://${context.DOMAIN_NAME}/agent-pickup.html` +
-        `?mode=conference` +
-        `&conf=${encodeURIComponent(confName)}` +
-        `&customer=${encodeURIComponent(customerNumber)}`;
+      const dashboardUrl = `https://${context.DOMAIN_NAME}/dashboard.html`;
       const payload = {
-        text: `:telephone_receiver: Active call: ${customerNumber}`,
+        text: `:telephone_receiver: Active call started: ${customerNumber}`,
         blocks: [
           {
             type: 'section',
             text: {
               type: 'mrkdwn',
               text:
-                `:telephone_receiver: *Active call in progress*\n` +
+                `:telephone_receiver: *Active call started*\n` +
                 `*Customer:* ${customerNumber}\n` +
                 `*Conference:* \`${confName}\``,
             },
@@ -159,8 +157,8 @@ exports.handler = async function (context, event, callback) {
               {
                 type: 'button',
                 style: 'primary',
-                text: { type: 'plain_text', text: 'Join this call' },
-                url: joinUrl,
+                text: { type: 'plain_text', text: 'Open Rep Dashboard' },
+                url: dashboardUrl,
               },
             ],
           },
@@ -170,8 +168,9 @@ exports.handler = async function (context, event, callback) {
               {
                 type: 'mrkdwn',
                 text:
-                  '_Use this to add a second rep (consult, escalation, ' +
-                  'or training). The original rep stays on the call._',
+                  '_Use the dashboard to join this call as a second ' +
+                  'rep (consult, escalation, training). The first rep ' +
+                  'stays on the call._',
               },
             ],
           },

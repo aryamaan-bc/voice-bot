@@ -82,8 +82,11 @@
       headingEl.textContent = 'Basic Capital — Take Next Caller (queue)';
       metaEl.textContent = 'Dequeues the head-of-queue caller from the bc-support queue.';
       joinBtn.textContent = 'Take next caller';
-      if (!customer) customerEl.textContent = '(head of queue — actual caller revealed on bridge)';
-      else customerEl.textContent = customer + ' (last known; head may differ)';
+      // Customer shown here is best-effort context. The dashboard
+      // already showed the actual head-of-queue caller before the rep
+      // clicked "Take next caller", so no need to hedge here.
+      if (!customer) customerEl.textContent = '(next in line)';
+      else customerEl.textContent = customer;
       intentEl.textContent = intent || '(unknown)';
       if (customer) fallbackEl.hidden = false;
     } else {

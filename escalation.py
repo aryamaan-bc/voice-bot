@@ -1121,19 +1121,14 @@ async def _run_v2_queue_handoff(
     # transition feels deliberate, not like a dropped call.
     yield AgentSendText(text=V2_TRANSFER_ANNOUNCEMENT, interruptible=False)
 
-    # Step 2 — Slack ping with the v2 pickup URL (?mode=queue). Button
-    # opens agent-pickup.html in queue mode → click Join → TwiML App
-    # invokes /agent-dial with mode=queue → <Dial><Queue> bridges to
-    # the head-of-queue caller. FIFO + atomicity provided by Twilio.
+    # Step 2 — Slack ping with the dashboard URL. The dashboard is the
+    # single rep action surface (v2.2). Reps see queue depth + active
+    # calls live, and click "Take next caller" from there — no more
+    # confusion between queue-entry DMs and active-call DMs.
     functions_domain = os.environ.get("TWILIO_FUNCTIONS_DOMAIN", "").strip()
     pickup_url: Optional[str] = None
     if functions_domain:
-        pickup_url = (
-            f"https://{functions_domain}/agent-pickup.html"
-            f"?mode=queue"
-            f"&customer={quote(caller_number)}"
-            f"&intent={quote(intent_summary[:140])}"
-        )
+        pickup_url = f"https://{functions_domain}/dashboard.html"
     slack_url = os.environ.get("SLACK_WEBHOOK_URL", "")
     if slack_url:
         try:

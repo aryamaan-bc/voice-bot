@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Basic Capital — Rep Dashboard</title>
+  <style>
+    :root { color-scheme: light dark; }
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      max-width: 640px; margin: 40px auto; padding: 0 16px; line-height: 1.5;
+    }
+    h1 { font-size: 22px; margin: 0 0 4px; }
+    h2 { font-size: 16px; margin: 32px 0 12px; color: #64748b; text-transform: uppercase; letter-spacing: 0.04em; }
+    h2 .count { color: #1e293b; }
+    .meta {
+      display: flex; justify-content: space-between; align-items: center;
+      font-size: 13px; color: #64748b; margin-bottom: 4px;
+    }
+    .meta .stale { color: #b91c1c; }
+    .refresh-btn {
+      background: none; border: 1px solid #cbd5e1; border-radius: 6px;
+      padding: 4px 10px; font-size: 12px; cursor: pointer; color: #475569;
+    }
+    .refresh-btn:hover { background: #f1f5f9; }
+    .card {
+      border: 1px solid #e2e8f0; border-radius: 10px;
+      padding: 16px; margin-bottom: 12px; background: #ffffff;
+    }
+    .card.head { border-color: #3b82f6; background: #eff6ff; }
+    .card .num {
+      font-size: 18px; font-weight: 600; color: #0f172a;
+    }
+    .card .sub { color: #64748b; font-size: 14px; margin-top: 4px; }
+    .card .conf {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px; color: #64748b; margin-top: 6px;
+    }
+    button.action {
+      margin-top: 12px; font-size: 15px; padding: 10px 18px;
+      background: #2563eb; color: white; border: 0; border-radius: 8px;
+      cursor: pointer; font-weight: 500;
+      min-height: 44px;
+    }
+    button.action:hover { background: #1d4ed8; }
+    button.action.secondary { background: #475569; }
+    button.action.secondary:hover { background: #334155; }
+    .empty { color: #64748b; font-style: italic; padding: 8px 0; }
+    .behind { color: #64748b; font-size: 13px; margin: 12px 0 4px; }
+    .behind-list { color: #64748b; font-size: 14px; padding-left: 24px; margin: 0; }
+    @media (prefers-color-scheme: dark) {
+      body { background: #0f172a; color: #e2e8f0; }
+      h2 { color: #94a3b8; }
+      h2 .count { color: #e2e8f0; }
+      .card { background: #1e293b; border-color: #334155; }
+      .card.head { background: #1e3a8a; border-color: #3b82f6; }
+      .card .num { color: #f1f5f9; }
+      .card .sub, .card .conf, .behind, .behind-list, .meta { color: #94a3b8; }
+      .refresh-btn { color: #cbd5e1; border-color: #334155; }
+      .refresh-btn:hover { background: #1e293b; }
+    }
+  </style>
+</head>
+<body>
+  <h1>Basic Capital — Rep Dashboard</h1>
+  <div class="meta">
+    <span id="updated">Loading...</span>
+    <button class="refresh-btn" id="refresh">↻ Refresh now</button>
+  </div>
+
+  <h2>Queue <span class="count" id="queue-count">(0)</span></h2>
+  <div id="queue-list"><p class="empty">Loading...</p></div>
+
+  <h2>Active calls <span class="count" id="active-count">(0)</span></h2>
+  <div id="active-list"><p class="empty">Loading...</p></div>
+
+  <script>
+    // Dashboard polls /dashboard-state every 5 seconds for live data
+    // and renders queue + active calls. No framework — vanilla JS.
+
+    const POLL_MS = 5000;
+    let lastData = null;
+
+    async function poll() {
+      try {
+        const resp = await fetch('/dashboard-state', {
+          cache: 'no-store',
+        });
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const data = await resp.json();
+        lastData = data;
+        render(data);
+        markUpdated(new Date(data.fetchedAt));
+      } catch (e) {
+        markStale(e.message);
+      }
+    }
+
+    function render(data) {
+      // === Queue ===
+      const qCount = document.getElementById('queue-count');
+      const qList = document.getElementById('queue-list');
+      qCount.textContent = '(' + data.queue.length + ')';
+      if (data.queue.length === 0) {
+        qList.innerHTML = '<p class="empty">No callers waiting.</p>';
+      } else {
+        const head = data.queue[0];
+        let html =
+          '<div class="card head">' +
+            '<div class="num">Next up: ' + escapeHtml(head.callerNumber) + '</div>' +
+            '<div class="sub">Waiting ' + fmtSec(head.waitTimeSeconds) + '</div>' +
+            '<button class="action" onclick="takeNext()">Take next caller</button>' +
+          '</div>';
+        if (data.queue.length > 1) {
+          html += '<p class="behind">Behind them in line:</p>';
+          html += '<ul class="behind-list">';
+          for (let i = 1; i < data.queue.length; i++) {
+            const c = data.queue[i];
+            html +=
+              '<li>#' + c.position + ' &mdash; ' +
+              escapeHtml(c.callerNumber) + ' (' + fmtSec(c.waitTimeSeconds) + ')</li>';
+          }
+          html += '</ul>';
+        }
+        qList.innerHTML = html;
+      }
+
+      // === Active calls ===
+      const aCount = document.getElementById('active-count');
+      const aList = document.getElementById('active-list');
+      aCount.textContent = '(' + data.activeCalls.length + ')';
+      if (data.activeCalls.length === 0) {
+        aList.innerHTML = '<p class="empty">No calls in progress.</p>';
+      } else {
+        const parts = [];
+        for (const c of data.activeCalls) {
+          const startedAgo = c.startedAt ? fmtAgo(c.startedAt) : '(unknown)';
+          const repsLabel = c.participantCount > 1
+            ? (c.participantCount - 1) + ' rep' + (c.participantCount - 1 === 1 ? '' : 's') + ' on call'
+            : 'awaiting rep';
+          parts.push(
+            '<div class="card">' +
+              '<div class="num">' + escapeHtml(c.callerNumber) + '</div>' +
+              '<div class="sub">' + repsLabel + ' &middot; started ' + startedAgo + '</div>' +
+              '<div class="conf">Conference: ' + escapeHtml(c.conferenceName) + '</div>' +
+              '<button class="action secondary" ' +
+                'onclick="joinCall(' + JSON.stringify(c.conferenceName) + ', ' +
+                                       JSON.stringify(c.callerNumber) + ')">' +
+                'Join this call' +
+              '</button>' +
+            '</div>'
+          );
+        }
+        aList.innerHTML = parts.join('');
+      }
+    }
+
+    function takeNext() {
+      // Opens the existing pickup page in queue mode. It calls
+      // /agent-dial?mode=queue which dequeues + creates conference.
+      window.open('/agent-pickup.html?mode=queue', '_blank', 'noopener');
+    }
+
+    function joinCall(confName, customer) {
+      // Opens the pickup page in conference mode. agent-dial returns
+      // <Dial><Conference> TwiML; rep joins the named conference.
+      const u =
+        '/agent-pickup.html?mode=conference' +
+        '&conf=' + encodeURIComponent(confName) +
+        '&customer=' + encodeURIComponent(customer || '');
+      window.open(u, '_blank', 'noopener');
+    }
+
+    function markUpdated(d) {
+      const el = document.getElementById('updated');
+      el.textContent = 'Updated ' + d.toLocaleTimeString();
+      el.classList.remove('stale');
+    }
+    function markStale(msg) {
+      const el = document.getElementById('updated');
+      el.textContent = 'Stale (refresh failed: ' + msg + ')';
+      el.classList.add('stale');
+    }
+
+    function fmtSec(sec) {
+      sec = Math.max(0, parseInt(sec || 0, 10));
+      const m = Math.floor(sec / 60);
+      const s = sec % 60;
+      return m + ':' + (s < 10 ? '0' : '') + s;
+    }
+    function fmtAgo(iso) {
+      try {
+        const ms = Date.now() - new Date(iso).getTime();
+        return fmtSec(Math.floor(ms / 1000)) + ' ago';
+      } catch (e) { return '(unknown)'; }
+    }
+    function escapeHtml(s) {
+      return String(s || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    document.getElementById('refresh').onclick = poll;
+    poll();
+    setInterval(poll, POLL_MS);
+  </script>
+</body>
+</html>
