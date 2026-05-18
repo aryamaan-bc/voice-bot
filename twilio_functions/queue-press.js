@@ -32,7 +32,7 @@ exports.handler = (context, event, callback) => {
   const twiml = new Twilio.twiml.VoiceResponse();
   twiml.say(
     { voice: 'Polly.Joanna' },
-    "Leave your message after the tone, then press pound when you're done or just hang up."
+    "Leave your message after the tone, then press pound to continue."
   );
   twiml.record({
     maxLength: 30,

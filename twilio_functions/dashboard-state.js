@@ -41,6 +41,30 @@ exports.handler = async function (context, event, callback) {
   const client = context.getTwilioClient();
   const queueName = context.TWILIO_QUEUE_NAME || 'bc-support';
 
+  // === Caller intent map ===
+  // One Sync Map list-call per dashboard poll. Built once and consulted
+  // for both queue members and active-conference customers. Failures
+  // here are non-fatal — dashboard just shows phone numbers without
+  // intent annotations.
+  const intentByCallSid = {};
+  try {
+    const items = await client.sync.v1.services('default')
+      .syncMaps('bc-call-intent').syncMapItems.list({ limit: 50 });
+    for (const it of items) {
+      if (it.data && it.data.intent) {
+        intentByCallSid[it.key] = it.data.intent;
+      }
+    }
+  } catch (e) {
+    // 404 on the map = no callers have entered yet. Anything else is a
+    // soft failure we log but tolerate.
+    if (e.status !== 404) {
+      console.warn(
+        `dashboard-state: intent map fetch failed (continuing without intents): ${e.message}`
+      );
+    }
+  }
+
   // === Queue members ===
   try {
     const queues = await client.queues.list({
@@ -68,6 +92,7 @@ exports.handler = async function (context, event, callback) {
             callSid: m.callSid,
             callerNumber,
             waitTimeSeconds: m.waitTime || 0,
+            intent: intentByCallSid[m.callSid] || null,
           };
         })
       );
@@ -92,6 +117,7 @@ exports.handler = async function (context, event, callback) {
       conferences.map(async (c) => {
         let participantCount = 0;
         let callerNumber = '(unknown)';
+        let customerCallSid = null;
         try {
           const participants = await client
             .conferences(c.sid)
@@ -102,6 +128,7 @@ exports.handler = async function (context, event, callback) {
               const call = await client.calls(p.callSid).fetch();
               if (call.from && !call.from.startsWith('client:')) {
                 callerNumber = call.from;
+                customerCallSid = p.callSid;
                 break;
               }
             } catch (e) {
@@ -118,6 +145,7 @@ exports.handler = async function (context, event, callback) {
           conferenceSid: c.sid,
           participantCount,
           callerNumber,
+          intent: customerCallSid ? (intentByCallSid[customerCallSid] || null) : null,
           startedAt: c.dateCreated && c.dateCreated.toISOString
             ? c.dateCreated.toISOString()
             : null,

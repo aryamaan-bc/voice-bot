@@ -33,6 +33,13 @@
       font-size: 18px; font-weight: 600; color: #0f172a;
     }
     .card .sub { color: #64748b; font-size: 14px; margin-top: 4px; }
+    .card .intent {
+      margin-top: 8px; padding: 8px 10px;
+      background: #f8fafc; border-left: 3px solid #cbd5e1;
+      border-radius: 4px; font-size: 14px; color: #334155;
+      font-style: italic;
+    }
+    .card.head .intent { background: #dbeafe; border-left-color: #3b82f6; color: #1e3a8a; }
     .card .conf {
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
       font-size: 12px; color: #64748b; margin-top: 6px;
@@ -57,6 +64,8 @@
       .card.head { background: #1e3a8a; border-color: #3b82f6; }
       .card .num { color: #f1f5f9; }
       .card .sub, .card .conf, .behind, .behind-list, .meta { color: #94a3b8; }
+      .card .intent { background: #0f172a; border-left-color: #475569; color: #cbd5e1; }
+      .card.head .intent { background: #1e293b; border-left-color: #60a5fa; color: #dbeafe; }
       .refresh-btn { color: #cbd5e1; border-color: #334155; }
       .refresh-btn:hover { background: #1e293b; }
     }
@@ -110,6 +119,9 @@
           '<div class="card head">' +
             '<div class="num">Next up: ' + escapeHtml(head.callerNumber) + '</div>' +
             '<div class="sub">Waiting ' + fmtSec(head.waitTimeSeconds) + '</div>' +
+            (head.intent
+              ? '<div class="intent">Wants: ' + escapeHtml(head.intent) + '</div>'
+              : '') +
             '<button class="action" onclick="takeNext()">Take next caller</button>' +
           '</div>';
         if (data.queue.length > 1) {
@@ -117,9 +129,13 @@
           html += '<ul class="behind-list">';
           for (let i = 1; i < data.queue.length; i++) {
             const c = data.queue[i];
+            const intentSuffix = c.intent
+              ? ' &mdash; <em>' + escapeHtml(c.intent) + '</em>'
+              : '';
             html +=
               '<li>#' + c.position + ' &mdash; ' +
-              escapeHtml(c.callerNumber) + ' (' + fmtSec(c.waitTimeSeconds) + ')</li>';
+              escapeHtml(c.callerNumber) + ' (' + fmtSec(c.waitTimeSeconds) + ')' +
+              intentSuffix + '</li>';
           }
           html += '</ul>';
         }
@@ -143,6 +159,9 @@
             '<div class="card">' +
               '<div class="num">' + escapeHtml(c.callerNumber) + '</div>' +
               '<div class="sub">' + repsLabel + ' &middot; started ' + startedAgo + '</div>' +
+              (c.intent
+                ? '<div class="intent">Wants: ' + escapeHtml(c.intent) + '</div>'
+                : '') +
               '<div class="conf">Conference: ' + escapeHtml(c.conferenceName) + '</div>' +
               '<button class="action secondary" ' +
                 'onclick="joinCall(' + JSON.stringify(c.conferenceName) + ', ' +

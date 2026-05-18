@@ -66,23 +66,30 @@ exports.handler = (context, event, callback) => {
     return callback(null, twiml);
   }
 
-  // Propagate query params so /queue-press has the full Slack-DM
-  // context once the caller routes there.
+  // Propagate query params so /queue-action (the <Enqueue> action URL)
+  // has the Slack-DM context once the caller leaves the queue.
   const qs = (k, v) => `${k}=${encodeURIComponent(v)}`;
-  const queuePressUrl =
-    `/queue-press?${[qs('call_id', callId), qs('caller', caller), qs('intent', intent)].join('&')}`;
+  const queueLeaveUrl =
+    `/queue-leave?${[qs('call_id', callId), qs('caller', caller), qs('intent', intent)].join('&')}`;
 
   // <Gather input="dtmf"> wraps the Say + Play so the keypad is live
   // throughout the wait. timeout=1 → after Play finishes, Gather waits
   // 1s for digits before completing → Twilio re-invokes waitUrl. Each
   // cycle is Say (~3s) + Play (~60s) + 1s = ~64s. Position update
   // fires every cycle; music between.
-  // Press-1 during the music routes immediately to /queue-press.
+  //
+  // Press-1 routes to /queue-leave (returns <Leave/>); the caller exits
+  // the queue, /queue-action fires with QueueResult=leave, and that
+  // handler redirects into /queue-press (voicemail intake). The
+  // <Leave/> hop is required — pointing directly at /queue-press kept
+  // the caller in the queue and re-invoked /queue-wait after each
+  // chained step, so they kept hearing position updates between
+  // voicemail prompts.
   const gather = twiml.gather({
     input: 'dtmf',
     numDigits: 1,
     timeout: 1,
-    action: queuePressUrl,
+    action: queueLeaveUrl,
     method: 'POST',
   });
   gather.say(
