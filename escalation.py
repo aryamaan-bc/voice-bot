@@ -151,11 +151,12 @@ QUEUE_DISPATCH_TRANSITION_MESSAGE = (
 # Spoken in the v2 handoff path RIGHT BEFORE the REST call.update moves
 # the caller's leg to Twilio. Hardcoded (not LLM-supplied) so the user
 # gets unambiguous wording every time, regardless of what Haiku chose
-# for spoken_announcement. Mentions the hold music explicitly so the
-# brief silence between Cartesia and Twilio doesn't feel like a dropped
-# call.
+# for spoken_announcement. Kept short — Twilio's /enqueue-customer Say
+# (spoken right after the handoff) introduces "our team" + the press-1
+# option, so this message just acknowledges the transition. Music
+# starts naturally so we don't promise it here (was a redundancy).
 V2_TRANSFER_ANNOUNCEMENT = (
-    "Transferring you to our team now — you'll hear our hold music in just a moment."
+    "One moment — transferring you now."
 )
 
 

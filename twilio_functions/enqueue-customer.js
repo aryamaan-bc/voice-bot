@@ -36,11 +36,11 @@ exports.handler = (context, event, callback) => {
 
   const twiml = new Twilio.twiml.VoiceResponse();
 
-  // Pre-queue announcement. Tells the caller they're being held + sets
-  // expectations + surfaces the press-1 callback option ONCE up front.
-  // Polly voice — Twilio doesn't have Cartesia's voice, so the change
-  // from Cartesia → Polly is the audio cue that the call has crossed
-  // from Cartesia to Twilio.
+  // Pre-queue announcement. First mention of "our team" (Cartesia's
+  // V2_TRANSFER_ANNOUNCEMENT was deliberately kept brief), introduces
+  // the press-1 callback option, and offers the stay-on-line
+  // alternative. Polly voice — the Cartesia → Polly switch is the
+  // audio cue that the call has crossed from Cartesia to Twilio.
   //
   // /queue-wait's <Gather input="dtmf"> keeps the keypad live for the
   // duration of the wait, so press-1 actually works at any point.
@@ -48,7 +48,7 @@ exports.handler = (context, event, callback) => {
   // so the position updates stay short and non-redundant.
   twiml.say(
     { voice: 'Polly.Joanna' },
-    'Putting you on hold. Stay on the line — or press 1 anytime to leave a message instead.'
+    "You're on hold for our team. Press 1 anytime to leave a callback message, or stay on the line."
   );
 
   // `waitUrlMethod` (NOT `waitMethod` — Twilio's TwiML schema rejected
