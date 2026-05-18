@@ -649,19 +649,17 @@ CANNOT connect this caller to a live human. The escalate_to_human tool \
 will automatically run the callback intake flow instead of probing the \
 team.
 
-When you call escalate_to_human, your `spoken_announcement` should \
-reflect that no immediate transfer is possible. AVOID phrases like \
-"connecting you now", "one moment, getting someone", "connecting you \
-to our team" — they imply a live transfer that won't happen. Use \
-phrasing like:
-  - "Sure — let me grab your details so someone can follow up on the \
-next business day. One sec."
-  - "Yeah, that's account-specific so I'd want our team to take a \
-look. They're offline right now, but let me grab your info so they \
-can reach out first thing."
-  - "Got it — I can't pull that up myself, but our team can. They're \
-out until the next business day; let me take down your details so \
-they can follow up."
+In after-hours mode the tool IGNORES your `spoken_announcement` value \
+— the bot speaks a hardcoded "Let me grab your name and a callback \
+number so someone can follow up on the next business day — what's \
+your full name?" immediately after the tool fires. So you can pass \
+anything brief for `spoken_announcement` (e.g. "Sure." or just "Okay"); \
+it won't be heard.
+
+AVOID phrasing in any OTHER speech (before the tool, or after \
+record_followup) that implies a live transfer: "connecting you now", \
+"one moment, getting someone", "connecting you to our team" — they're \
+wrong because no transfer is happening.
 
 Everything else (FAQ answering, the atomic-tool rule, the callback \
 intake flow after escalate_to_human, pronunciation conventions) is \
@@ -844,12 +842,13 @@ async def get_agent(env: AgentEnv, call_request: CallRequest):
                     # ("Sure — one moment, connecting you to our team")
                     # promised a transfer that wouldn't happen when the
                     # caller landed in queue.
-                    spoken_announcement=(
-                        "Sure — let me grab your details so someone can "
-                        "follow up on the next business day. One sec."
-                        if after_hours
-                        else "Let me check on that for you — one moment."
-                    ),
+                    #
+                    # NOTE: run_escalation_flow skips yielding this when
+                    # after_hours=True (AFTER_HOURS_UNAVAILABLE_MESSAGE
+                    # opens the callback intake instead — yielding both
+                    # produced back-to-back duplicate prompts), so the
+                    # string only matters for in-hours Case 9.
+                    spoken_announcement="Let me check on that for you — one moment.",
                     intent_summary=(
                         f"Caller explicitly asked for a human "
                         f"(pattern-detected from: {user_text[:140]!r})"

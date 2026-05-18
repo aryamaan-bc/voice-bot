@@ -550,7 +550,14 @@ async def run_escalation_flow(
             else spoken_announcement
         )
         announcement_start = time.monotonic()
-        yield AgentSendText(text=announced_text, interruptible=False)
+        # Skip the announcement when after_hours — AFTER_HOURS_UNAVAILABLE_MESSAGE
+        # already opens the callback intake with "Let me grab your name and a
+        # callback number so someone can follow up on the next business day —
+        # what's your full name?". Yielding the LLM-supplied (or Case 9-
+        # hardcoded) announcement on top produces back-to-back duplicate
+        # "grab your details" / "next business day" speech to the caller.
+        if not after_hours:
+            yield AgentSendText(text=announced_text, interruptible=False)
 
         # Direct-admit probe wait: tell the caller their position so
         # every escalation has a position-aware framing (unified UX with
