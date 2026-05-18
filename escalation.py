@@ -54,7 +54,18 @@ from slack_ticket import send_queue_entry_ping
 logger = logging.getLogger(__name__)
 
 
-PROBE_TIMEOUT_SECONDS = 60  # upper bound on how long we wait for someone to answer
+_PROBE_TIMEOUT_DEFAULT = 60  # upper bound default; overridable via PROBE_TIMEOUT_SECONDS env var
+
+
+def _probe_timeout_seconds() -> int:
+    """How long the probe waits for someone to join the conference
+    before falling through to callback intake. Read fresh per call so
+    `cartesia env set` takes effect without a code redeploy. Defaults
+    to 60s (tight enough that production reps watching Slack actively
+    answer in time; staging can override to 180s+ for solo testing)."""
+    return _int_env("PROBE_TIMEOUT_SECONDS", _PROBE_TIMEOUT_DEFAULT)
+
+
 POLL_INTERVAL_SECONDS = 1
 
 # Module-level reference to keep probe tasks alive across LLM hijacks.
@@ -876,7 +887,7 @@ async def _wait_for_browser_pickup(
     twilio_sid = _env("TWILIO_ACCOUNT_SID")
     twilio_token = _env("TWILIO_AUTH_TOKEN")
     client = Client(twilio_sid, twilio_token)
-    joined = await _wait_for_participant(client, conf_name, PROBE_TIMEOUT_SECONDS)
+    joined = await _wait_for_participant(client, conf_name, _probe_timeout_seconds())
     if joined:
         redirect_task = asyncio.create_task(
             _delayed_force_redirect(
@@ -1031,7 +1042,7 @@ async def _real_probe(call_id: str, caller_number: str) -> bool:
         return False
 
     logger.info("Probe calls placed for call_id=%s", call_id)
-    joined = await _wait_for_participant(client, conf_name, PROBE_TIMEOUT_SECONDS)
+    joined = await _wait_for_participant(client, conf_name, _probe_timeout_seconds())
 
     if not joined:
         # Cancel ringing legs so we don't keep ringing after the caller
