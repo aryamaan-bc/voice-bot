@@ -37,19 +37,18 @@ exports.handler = (context, event, callback) => {
   const twiml = new Twilio.twiml.VoiceResponse();
 
   // Pre-queue announcement. Tells the caller they're being held + sets
-  // hold-music expectation. Polly voice — Twilio doesn't have
-  // Cartesia's voice, so the change from Cartesia → Polly is the audio
-  // cue that the call has crossed from Cartesia to Twilio.
+  // expectations + surfaces the press-1 callback option ONCE up front.
+  // Polly voice — Twilio doesn't have Cartesia's voice, so the change
+  // from Cartesia → Polly is the audio cue that the call has crossed
+  // from Cartesia to Twilio.
   //
-  // No press-1 mention here: Twilio's <Enqueue> waitUrl TwiML only
-  // permits <Say>, <Play>, <Pause>, <Redirect>, <Leave> — <Gather> is
-  // forbidden, so DTMF capture inside the queue isn't possible. The
-  // only escape from the queue (other than a rep dequeuing) is the
-  // 15-min hard-timeout <Leave/> in /queue-wait, which routes to the
-  // voicemail-intake flow automatically.
+  // /queue-wait's <Gather input="dtmf"> keeps the keypad live for the
+  // duration of the wait, so press-1 actually works at any point.
+  // We only mention it HERE (not again in /queue-wait's per-cycle Say)
+  // so the position updates stay short and non-redundant.
   twiml.say(
     { voice: 'Polly.Joanna' },
-    "Putting you on hold for our team. Please stay on the line — we'll connect you as soon as a rep frees up."
+    'Putting you on hold. Stay on the line — or press 1 anytime to leave a message instead.'
   );
 
   // `waitUrlMethod` (NOT `waitMethod` — Twilio's TwiML schema rejected

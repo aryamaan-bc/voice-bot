@@ -5,19 +5,22 @@
  * invocation returns a finite TwiML response (~30-60s of audio); when
  * playback finishes, Twilio re-invokes this URL with updated QueueTime.
  *
- * Twilio's <Enqueue> waitUrl TwiML schema is restrictive: ONLY <Say>,
- * <Play>, <Pause>, <Redirect>, <Leave> are valid. <Gather> is NOT
- * allowed — Twilio throws "application error" if you try.
+ * Twilio's <Enqueue> waitUrl TwiML schema permits: <Say>, <Play>,
+ * <Pause>, <Hangup>, <Redirect>, <Leave>, and <Gather> with
+ * input="dtmf" or input="speech". (Per Twilio docs: an earlier read
+ * mistakenly excluded <Gather> — it IS allowed.)
  *
- * So every TwiML response (except <Leave/> at hard-timeout) is just:
- *   <Say>You're number N in line — thanks for holding.</Say>
- *   <Play>hold music</Play>
+ * Every TwiML response (except <Leave/> at hard-timeout) is:
+ *   <Gather input="dtmf" timeout=1 action="/queue-press">
+ *     <Say>You're number N in line — thanks for holding.</Say>
+ *     <Play>hold music</Play>
+ *   </Gather>
  *
  * Position update fires every cycle (~every minute as music segments
- * end and Twilio re-invokes waitUrl). No press-1 inside the queue —
- * the keypad can't be live in waitUrl context. The only escape from
- * the queue (other than a rep dequeuing) is the 15-min hard-timeout
- * <Leave/>, which routes to /queue-press (voicemail intake).
+ * end and Twilio re-invokes waitUrl). Press-1 keypad is live
+ * throughout — pressing 1 routes to /queue-press (voicemail intake).
+ * At MAX_QUEUE_WAIT_SECONDS we return <Leave/>; queue-action fires
+ * with QueueResult=leave and redirects the caller to /queue-press.
  *
  * Twilio passes these inputs:
  *   QueueTime         — seconds since the caller was enqueued
@@ -39,11 +42,16 @@ exports.handler = (context, event, callback) => {
   const intent = (event.intent || '').toString().slice(0, 200);
 
   const maxWait = parseInt(context.MAX_QUEUE_WAIT_SECONDS || '900', 10);
-  // Twilio's free classical hold music. Override via HOLD_MUSIC_URL env
-  // var to use a branded MP3 (recommended: host as an Asset in the same
-  // Functions service so the URL stays inside Twilio's CDN).
+  // Twilio-hosted hold music fallback. The old com.twilio.music.classical
+  // S3 bucket was emptied (returns 404 NoSuchKey + application/xml,
+  // which crashed <Play> with Twilio alerts 11200 + 12300). Switched to
+  // demo.twilio.com/docs/classic.mp3 — same Twilio-hosted CDN file used
+  // in Twilio's <Play> docs examples, returns audio/mpeg + HTTP 200.
+  // Override via HOLD_MUSIC_URL env var to use a branded MP3 (recommended:
+  // host as a Twilio Asset in this Functions service so the URL stays
+  // inside Twilio's CDN — future v2.1 enhancement).
   const holdMusicUrl = (context.HOLD_MUSIC_URL || '').trim() ||
-    'http://com.twilio.music.classical.s3.amazonaws.com/BusyStrings.wav';
+    'https://demo.twilio.com/docs/classic.mp3';
 
   const twiml = new Twilio.twiml.VoiceResponse();
 
@@ -56,13 +64,29 @@ exports.handler = (context, event, callback) => {
     return callback(null, twiml);
   }
 
-  // Just <Say> + <Play> — both valid waitUrl verbs per Twilio's TwiML
-  // schema. No <Gather> (would cause an application error).
-  twiml.say(
+  // Propagate query params so /queue-press has the full Slack-DM
+  // context once the caller routes there.
+  const qs = (k, v) => `${k}=${encodeURIComponent(v)}`;
+  const queuePressUrl =
+    `/queue-press?${[qs('call_id', callId), qs('caller', caller), qs('intent', intent)].join('&')}`;
+
+  // <Gather input="dtmf"> wraps the Say + Play so the keypad is live
+  // throughout the wait. timeout=1 → after Play finishes Twilio waits
+  // 1s for digits before re-invoking waitUrl. Each cycle is roughly
+  // music_duration + 1s. Press-1 routes immediately to /queue-press
+  // (voicemail intake).
+  const gather = twiml.gather({
+    input: 'dtmf',
+    numDigits: 1,
+    timeout: 1,
+    action: queuePressUrl,
+    method: 'POST',
+  });
+  gather.say(
     { voice: 'Polly.Joanna' },
     `You're number ${queuePosition} in line — thanks for holding.`
   );
-  twiml.play(holdMusicUrl);
+  gather.play(holdMusicUrl);
 
   console.log(
     `queue-wait call_id=${callId} pos=${queuePosition} elapsed=${queueTime}s`
