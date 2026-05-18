@@ -114,38 +114,95 @@ is designed so that **a caller asking for a human cannot end the call
 without the team being notified** (`log_escalation_started` is the floor).
 Don't introduce a code path that breaks that guarantee.
 
-## Queue (Cases 10-12) — coming in the queue-v1 rollout
+## Queue (Cases 10-12) — two implementations live, selected by `QUEUE_VERSION`
 
-When `QUEUE_ENABLED=true` (gated behind a feature flag during burn-in), a
-new `queue_wait` phase sits between "FAQ" and "transferred". Customers who
-escalate while both reps are busy hold in a silent-hold queue with
-position updates instead of dropping straight to callback intake. The
-implementation lives in `hold_queue.py` (new module, slice 3) + a `phase` field
-on `escalation_status` replacing the existing boolean `in_progress` (slice
-2). Plan file: `~/.claude/plans/crystalline-sleeping-aho.md`.
+When `QUEUE_ENABLED=true`, callers who escalate while reps are busy hold in a
+queue. Two implementations exist in the codebase; `QUEUE_VERSION` env var
+selects which one runs:
 
-The three new invariants to preserve when working on queue code:
+- **`QUEUE_VERSION=v2`** (default after the v2 rollout) — **Twilio Enqueue**.
+  Cartesia speaks one announcement, hands the call out to Twilio via REST API
+  `call.update`, and the customer holds in a Twilio queue with real hold music
+  + position updates + a press-1-to-leave-message option. Reps dequeue by
+  clicking a Slack "Take next caller" button → browser pickup → `<Dial><Queue>`
+  atomically bridges to the head-of-queue caller. Bridge recording happens on
+  `<Dial>`. Plan file: `~/.claude/plans/crystalline-sleeping-aho.md`.
 
-- **Case 10: Hangup during queue wait** — the `CallEnded` handler must
-  call `hold_queue.dequeue(call_id)` AND log `outcome="abandoned_in_queue"`
-  (not generic `abandoned`). Without the dequeue, a phantom entry blocks
-  subsequent customers' position advancement.
+- **`QUEUE_VERSION=v1`** (preserved as instant rollback) — **in-Cartesia
+  silent hold**. The customer stays in the Cartesia session; `hold_queue.py`
+  owns a Python `asyncio` FIFO + shared poller; `_wait_in_queue` yields
+  position-update TTS every 45s + conversational check-ins every 3 min via the
+  LLM. No hold music (Cartesia Line SDK exposes no audio-injection event).
 
-- **Case 11: Queue hard-timeout** — when `MAX_QUEUE_WAIT_SECONDS` elapses
-  without a slot freeing, the customer must drop into the standard
-  callback-intake flow (`TEAM_UNAVAILABLE_MESSAGE` → `record_followup` →
-  `outcome="callback_logged"`), NOT a silent hangup. Same "no caller
-  asking for a human can end the call without the team being notified"
-  guarantee as the Cases 1-9 invariant.
+Rollback is **one env var flip + `cartesia env set`** (no code redeploy):
+set `QUEUE_VERSION=v1` if v2 misbehaves. Both code paths live in the same
+binary.
 
-- **Case 12: Dispatch race** — two customers seeing `slot_free=True`
-  simultaneously must not both self-promote to `probe_wait`. The
-  `_ACTIVE_PROBES` counter incremented/decremented under `_QUEUE_LOCK` is
-  the only correct guard. Don't poll Twilio independently from each
-  customer's coroutine; one shared poller per process is the design.
+### The three invariants (preserved in BOTH v1 and v2)
 
-While the feature flag is off (default), none of this code is reachable —
-`escalate_to_human` runs the existing probe-or-callback path verbatim.
+- **Case 10: Hangup during queue wait** — caller hangs up while holding.
+  - v1: `main.py` CallEnded handler reads `phase == "queue_wait"`, logs
+    `outcome="abandoned_in_queue"`, calls `hold_queue.dequeue(call_id)`.
+  - v2: Twilio's `/queue-action` Function fires with `QueueResult=hangup` →
+    posts the `abandoned_in_queue` Linear ticket via Linear API directly from
+    the Function. Cartesia's CallEnded fires too but sees
+    `phase == "queue_handoff"` and suppresses its own abandoned ticket
+    (Twilio is authoritative once the call is handed off).
+
+- **Case 11: Queue hard-timeout** — `MAX_QUEUE_WAIT_SECONDS` elapses.
+  - v1: `_wait_in_queue`'s loop notices `elapsed >= max_wait`, speaks the
+    `QUEUE_TIMEOUT_INTAKE_MESSAGE`, dequeues, hands the LLM control of
+    callback intake → `outcome="callback_logged"`.
+  - v2: `/queue-wait` Function returns `<Leave/>` after `MAX_QUEUE_WAIT_SECONDS`,
+    queue-action redirects into `/queue-press` (the voicemail+callback intake
+    flow), and the chained Functions post **ONE consolidated Slack DM** with
+    both the voicemail audio link AND the caller's keypad-entered callback
+    number. Linear `outcome="voicemail_logged"`.
+
+- **Case 12: Dispatch race** — two reps / two callers / atomic FIFO.
+  - v1: `_ACTIVE_PROBES` counter incremented/decremented under `_QUEUE_LOCK`
+    in `hold_queue.py`. Shared poller per process — one source of truth.
+  - v2: not a code concern. Twilio's `<Dial><Queue>` pops the head atomically;
+    two reps clicking simultaneously each pop a different caller. No counter,
+    no lock, no shared poller in Python.
+
+### "Is a rep busy?" in v2 — there is no explicit check
+
+v1 has `try_admit` to decide if a slot is free. v2 deletes that question:
+every escalation enters the Twilio queue, every dispatch is rep-driven via
+the Slack button. **Busy reps physically can't click the button because
+they're on a call.** The rep's attention IS the busy signal — no
+`MAX_CONCURRENT_REPS`, no `_ACTIVE_PROBES`, no slot tracking. Twilio's queue
+serializes naturally.
+
+The one edge case: a rep clicks "Take next caller" while still on a call.
+Twilio bridges them to a second call in a second browser tab. They'd have to
+hang up the new leg or finish the current call first. Mitigation (out of v2
+scope): a `/queue-claim` Function pre-check that returns `{busy: true}` if
+the rep already has an in-progress call. Add only if premature clicks become
+a real problem in burn-in.
+
+### Cartesia → Twilio ownership boundary (v2 only)
+
+Once `escalation.py` issues the REST `call.update` to `/enqueue-customer`,
+the call leg leaves Cartesia. From that moment:
+
+- The CallEnded event WILL fire in Cartesia (the WebSocket closes), but the
+  abandoned-ticket handler must NOT fire — Twilio's `/queue-action` Function
+  is now the source of truth for the outcome. Main.py CallEnded handler
+  checks `phase == "queue_handoff"` and skips its own ticket.
+- Linear tickets after this point are posted by **Twilio Functions, not
+  Python**. The Functions service needs `LINEAR_API_KEY` + `LINEAR_TEAM_ID` in
+  its env (mirror prod values).
+- The bridge recording (when a rep joins via `<Dial><Queue>`) is on `<Dial>`,
+  not `<Queue>` — the queue side is hold music, not a recordable conference.
+  Recording-callback URL: `?type=queue_bridged`.
+
+If you touch any of this, think through the boundary: who fires the final
+ticket? Cartesia or Twilio? Mistake = duplicate tickets per call.
+
+When the master flag (`QUEUE_ENABLED`) is off, neither queue runs —
+`escalate_to_human` falls straight to the legacy probe-then-callback flow.
 
 ## The atomic-tool rule (the #1 bug source)
 

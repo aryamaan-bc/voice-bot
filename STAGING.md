@@ -45,17 +45,51 @@ Staging is deployed FROM the local files, so staging has all these features. Aft
 
 ## Phased rollout (from the plan)
 
-Plan file: `~/.claude/plans/crystalline-sleeping-aho.md`. Slice order:
+Plan file: `~/.claude/plans/crystalline-sleeping-aho.md`.
 
-1. **Slice 0** — Docs + prompt updates (CLAUDE.md, README.md, system prompt). Zero runtime risk. Start here.
-2. **Slice 1** — Add `queue_waiting` + `abandoned_in_queue` to `linear_ticket.py`'s `Outcome` literal. Tiny, no callers yet.
-3. **Slice 2** — Refactor `escalation_status["in_progress"]: bool` → `phase: str` enum. Pure refactor; every existing guard migrated atomically (Case 8/9, record_followup, end_call_with_goodbye).
-4. **Slice 3** — `hold_queue.py` with `_QUEUE`, `_QUEUE_LOCK`, `_ACTIVE_PROBES`, shared poller. Not wired yet. (Module name avoids shadowing the Python stdlib `queue` module.)
-5. **Slice 4** — Queue admission + silent hold + dispatch. Gated by `QUEUE_ENABLED=true` in `.env.staging`.
-6. **Slice 5** — Graceful shutdown handler (atexit best-effort flush).
-7. **Slice 6** — Per-call conference suffix to avoid same-caller redial collisions.
-8. **Slice 7** — Flip `QUEUE_ENABLED=true` on production after staging burn-in.
-9. **Slice 8 (v2)** — Convert `_QUEUE` to Twilio Sync List for multi-instance safety. Defer.
+### v1 (silent hold) — landed on staging
+
+1. **Slice 0** — Docs + prompt updates (CLAUDE.md, README.md). Done.
+2. **Slice 1** — Add `queue_waiting` + `abandoned_in_queue` to `Outcome` literal. Done.
+3. **Slice 2** — Refactor `escalation_status["in_progress"]: bool` → `phase: str` enum. Done.
+4. **Slice 3** — `hold_queue.py` with `_QUEUE`, `_QUEUE_LOCK`, `_ACTIVE_PROBES`, shared poller. Done.
+5. **Slice 4** — Queue admission + silent hold + dispatch. Done.
+6. **Slice 4.5** — Conversational hold (LLM dispatch during queue_wait, record_followup opt-out). Done.
+7. **Hybrid long-wait UX** — periodic check-ins + 15-min safety floor. Done. Deployed to staging at `MAX_CONCURRENT_REPS=1` for solo testing.
+
+### v2 (Twilio Enqueue with hold music) — in progress
+
+User feedback after v1 staging burn-in: callers expect real hold music, not silence + TTS position updates. Cartesia Line SDK has no audio-injection event, so the call must move out to Twilio for the wait. v2 architecture is documented in the plan.
+
+v1 is **not deleted** — `QUEUE_VERSION` env var (default `v2` after rollout) selects which implementation runs. Rollback = `QUEUE_VERSION=v1` + `cartesia env set` (no code redeploy).
+
+| Slice | Files | What changes |
+|-------|-------|--------------|
+| v2-0 | CLAUDE.md, README.md, STAGING.md | Doc updates: v2 architecture + QUEUE_VERSION rollback. Zero runtime change. **(this slice)** |
+| v2-1 | `twilio_functions/enqueue-customer.js`, `queue-wait.js`, `queue-action.js`, `queue-press.js`, `queue-after-record.js`, `queue-callback-saved.js` (all NEW) | Deploy 6 new Twilio Functions. Chained voicemail→gather flow → one consolidated Slack DM. |
+| v2-2 | `agent-dial.js`, `agent-pickup.html`, `recording-callback.js` (MODIFIED) | Add `mode=queue` branch. Backward-compatible. |
+| v2-3 | `linear_ticket.py` | Add `voicemail_logged` outcome. |
+| v2-4 | `escalation.py`, `main.py`, `slack_ticket.py` | Wire v2 alongside v1, gated by `QUEUE_VERSION`. v1 code preserved untouched. |
+| v2-6 | `.env.staging.local`, staging Functions service env | Set `QUEUE_VERSION`, `TWILIO_QUEUE_NAME`, `HOLD_MUSIC_URL`, `MAX_QUEUE_WAIT_SECONDS`, `LINEAR_API_KEY`, `LINEAR_TEAM_ID` on Functions. Push Cartesia env. Deploy. |
+| v2-7 | (manual) | Burn-in: 8 test cases from the plan (verifies both `v2` happy path AND `QUEUE_VERSION=v1` rollback). |
+| v2-8 | prod `.env` | After burn-in: mirror Functions to prod service, set `QUEUE_ENABLED=true` on prod, deploy. |
+
+Slice v2-5 (delete v1 code) is intentionally **skipped** — v1 stays as the rollback path until v2 has weeks of solid burn-in. Cleanup happens in a separate later PR.
+
+## QUEUE_VERSION rollback runbook (v2 only)
+
+If v2 misbehaves on staging or production:
+
+```bash
+# Edit .env (or .env.staging.local for staging) — change one line:
+QUEUE_VERSION=v1   # was v2
+
+# Push to Cartesia. Auto-creates a new deployment.
+cartesia env set --from=.env.staging.local --agent-id=agent_sxQV2ZUGSBN8KY8uQKsSr2
+# (or for prod: --agent-id=agent_CicivQhXS56dgUehm3B1Ea)
+```
+
+No code redeploy needed — both v1 and v2 implementations are in the same binary. Effective within ~30 seconds. To re-enable v2 after fixes, flip back.
 
 ## Deploy commands (staging only)
 

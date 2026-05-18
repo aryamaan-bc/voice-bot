@@ -185,7 +185,13 @@ cartesia logs --follow
 
 ### Queue (when reps are all busy)
 
-When `QUEUE_ENABLED=true` and the active-conference count reaches `MAX_CONCURRENT_REPS`, a new escalation lands in a FIFO queue instead of running the 60s probe. The customer hears their position and waits in silent hold; the bot dispatches them when a rep frees up, or falls through to callback intake after `MAX_QUEUE_WAIT_SECONDS`. See CLAUDE.md "Queue (Cases 10-12)" for failure-mode handling. Disabled by default until queue code lands.
+When `QUEUE_ENABLED=true`, a caller who escalates while reps are busy lands in a hold queue. Two implementations live in the codebase and `QUEUE_VERSION` selects which runs:
+
+- **`QUEUE_VERSION=v2`** (default) — **Twilio Enqueue with hold music.** Cartesia speaks one announcement, then hands the call out to a Twilio queue. The caller hears real hold music + a "you're number N in line" position update every minute. After 3 minutes the caller can press 1 to leave a voicemail + keypad callback number (consolidated into one Slack DM). At 15 minutes the queue auto-routes to the voicemail intake. Reps dequeue by clicking a Slack "Take next caller" button — Twilio bridges them to the head-of-queue caller via `<Dial><Queue>`. No explicit "rep busy" check; the rep's attention is the bottleneck.
+
+- **`QUEUE_VERSION=v1`** (preserved as instant rollback) — **in-Cartesia silent hold.** Customer stays in the Cartesia session. Position updates speak every 45s, conversational check-ins ("still want to wait?") every 3 min. No hold music — Cartesia Line SDK exposes no audio-injection event. See CLAUDE.md "Queue (Cases 10-12)" for the failure-mode handling shared by both implementations.
+
+Rollback procedure: edit `QUEUE_VERSION=v1` in `.env.staging.local`, run `cartesia env set`. No code redeploy — both paths are live in the same binary. See `STAGING.md` and `~/.claude/plans/crystalline-sleeping-aho.md` for the full v2 architecture, rollback runbook, and rollout slice list.
 
 ### Outside business hours
 
