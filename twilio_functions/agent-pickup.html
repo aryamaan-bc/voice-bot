@@ -46,6 +46,7 @@
   </div>
   <div class="meta" id="meta">Conference: <code id="conf">(none)</code></div>
   <button id="join">Join call</button>
+  <button id="mute" disabled>🔇 Mute</button>
   <button id="hangup" disabled>Hang up</button>
   <div class="status" id="log">Idle.</div>
   <div class="fallback" id="fallback" hidden>
@@ -69,6 +70,7 @@
     const customerEl = document.getElementById('customer');
     const intentEl = document.getElementById('intent');
     const joinBtn = document.getElementById('join');
+    const muteBtn = document.getElementById('mute');
     const hangupBtn = document.getElementById('hangup');
     const logEl = document.getElementById('log');
     const fallbackEl = document.getElementById('fallback');
@@ -158,12 +160,15 @@
           fallbackEl.classList.remove('urgent');
           log('Connected. You are live with the caller.', 'ok');
           hangupBtn.disabled = false;
+          muteBtn.disabled = false;
+          muteBtn.textContent = '🔇 Mute';  // reset label on each new call
         });
         call.on('disconnect', () => {
           connected = false;
           clearWatchdog();
           log('Call ended.', '');
           hangupBtn.disabled = true;
+          muteBtn.disabled = true;
           joinBtn.disabled = false;
         });
         call.on('cancel', () => {
@@ -187,10 +192,31 @@
       }
     };
 
+    // Mute toggle — uses the Twilio Voice JS SDK's call.mute(bool)
+    // method. When muted, the rep's mic is gated locally in the SDK so
+    // their audio never reaches Twilio's conference. Twilio's
+    // conference participants do NOT get a "mute" announcement; this
+    // is silent on the customer's side.
+    let muted = false;
+    muteBtn.onclick = () => {
+      if (!call) return;
+      muted = !muted;
+      try {
+        call.mute(muted);
+      } catch (e) {
+        log('Mute toggle failed: ' + (e && e.message || e), 'err');
+        muted = !muted;  // revert state on failure
+        return;
+      }
+      muteBtn.textContent = muted ? '🎤 Unmute' : '🔇 Mute';
+      log(muted ? 'Muted. Customer cannot hear you.' : 'Unmuted. You are live.', 'ok');
+    };
+
     hangupBtn.onclick = () => {
       if (call) { try { call.disconnect(); } catch (_) {} }
       if (device) { try { device.destroy(); } catch (_) {} }
       hangupBtn.disabled = true;
+      muteBtn.disabled = true;
       joinBtn.disabled = false;
       log('Disconnected.');
     };
