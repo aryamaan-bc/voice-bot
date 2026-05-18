@@ -25,6 +25,15 @@ exports.handler = async function (context, event, callback) {
     return callback(null, '');
   }
 
+  // v2 distinguishes two recording sources:
+  //   - "queue_bridged" — recording of a <Dial><Queue> bridged
+  //     conversation (rep + caller). Posted with a queue-specific
+  //     header so the team knows it came from the v2 path.
+  //   - default / unset / "conference" — legacy conference recording
+  //     (v1 path or after-hours fallback). Same as today's behavior.
+  const recordingType = (event.type || '').toString();
+  const isQueueBridged = recordingType === 'queue_bridged';
+
   const recordingUrl = event.RecordingUrl || '';
   const recordingSid = event.RecordingSid || '';
   const conferenceSid = event.ConferenceSid || 'n/a';
@@ -43,12 +52,19 @@ exports.handler = async function (context, event, callback) {
     ? `<${consoleUrl}|Listen in Twilio Console> (login required)`
     : '(recording URL missing from callback)';
 
+  const headerText = isQueueBridged
+    ? ':tape: Queue-bridged call recording'
+    : ':tape: Conference recording';
+  const summaryText = isQueueBridged
+    ? `:tape: Queue-bridged recording ready — caller ${customerNumber} — ${durationLabel}`
+    : `:tape: Conference recording ready — caller ${customerNumber} — ${durationLabel}`;
+
   const payload = {
-    text: `:tape: Conference recording ready — caller ${customerNumber} — ${durationLabel}`,
+    text: summaryText,
     blocks: [
       {
         type: 'header',
-        text: { type: 'plain_text', text: ':tape: Conference recording' },
+        text: { type: 'plain_text', text: headerText },
       },
       {
         type: 'section',

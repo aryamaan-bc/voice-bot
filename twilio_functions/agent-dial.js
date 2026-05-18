@@ -29,6 +29,30 @@
  */
 exports.handler = function (context, event, callback) {
   const twiml = new Twilio.twiml.VoiceResponse();
+  const mode = (event.mode || '').toString();
+
+  // v2 queue path — rep dequeues by joining the named Twilio queue.
+  // `<Dial><Queue>` atomically pops the head-of-queue caller and bridges
+  // them to the rep's browser leg. FIFO + atomicity provided by Twilio
+  // (no Python lock needed). Recording goes on `<Dial>`, not `<Queue>`,
+  // because the queue side is hold music — only the bridged conversation
+  // is recordable.
+  if (mode === 'queue') {
+    const queueName = context.TWILIO_QUEUE_NAME || 'bc-support';
+    const recordingCallbackUrl =
+      `https://${context.DOMAIN_NAME}/recording-callback?type=queue_bridged`;
+    twiml
+      .dial({
+        record: 'record-from-answer',
+        recordingStatusCallback: recordingCallbackUrl,
+        recordingStatusCallbackEvent: 'completed',
+      })
+      .queue(queueName);
+    return callback(null, twiml);
+  }
+
+  // v1 / legacy conference path — rep joins a specific named conference
+  // that the customer's call leg is already in.
   const rawConf = (event.conference || '').toString();
   const confName = rawConf.replace(/[^a-zA-Z0-9-]/g, '').slice(0, 64);
 

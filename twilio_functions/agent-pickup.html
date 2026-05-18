@@ -39,12 +39,12 @@
   </style>
 </head>
 <body>
-  <h1>Basic Capital — Take Call</h1>
+  <h1 id="heading">Basic Capital — Take Call</h1>
   <div class="caller">
     <div><strong>Caller:</strong> <span id="customer">(unknown)</span></div>
     <div><strong>Wants:</strong> <span id="intent">(unknown)</span></div>
   </div>
-  <div class="meta">Conference: <code id="conf">(none)</code></div>
+  <div class="meta" id="meta">Conference: <code id="conf">(none)</code></div>
   <button id="join">Join call</button>
   <button id="hangup" disabled>Hang up</button>
   <div class="status" id="log">Idle.</div>
@@ -55,11 +55,17 @@
   <script src="https://unpkg.com/@twilio/voice-sdk@2.10.0/dist/twilio.min.js"></script>
   <script>
     const params = new URLSearchParams(location.search);
+    // v2: `mode=queue` makes the page dequeue the head-of-queue caller
+    // via `<Dial><Queue>`. v1 / legacy: `conf=<name>` specifies a
+    // named conference to join.
+    const mode = (params.get('mode') || '').toLowerCase();
     const conf = (params.get('conf') || '').replace(/[^a-zA-Z0-9-]/g, '');
     const identity = (params.get('id') || 'bc-agent').replace(/[^a-zA-Z0-9_.-]/g, '').slice(0, 32);
     const customer = (params.get('customer') || '').slice(0, 32);
     const intent = (params.get('intent') || '').slice(0, 200);
+    const headingEl = document.getElementById('heading');
     const confEl = document.getElementById('conf');
+    const metaEl = document.getElementById('meta');
     const customerEl = document.getElementById('customer');
     const intentEl = document.getElementById('intent');
     const joinBtn = document.getElementById('join');
@@ -67,14 +73,30 @@
     const logEl = document.getElementById('log');
     const fallbackEl = document.getElementById('fallback');
 
-    confEl.textContent = conf || '(missing)';
-    customerEl.textContent = customer || '(unknown — older Slack link)';
-    intentEl.textContent = intent || '(unknown)';
-    if (customer) fallbackEl.hidden = false;
-    if (!conf) {
-      joinBtn.disabled = true;
-      logEl.textContent = 'No conference name in URL. Open the link from the Slack button.';
-      logEl.classList.add('err');
+    if (mode === 'queue') {
+      // v2 UX: dequeue the head-of-queue caller. `customer` and `intent`
+      // are best-effort from the Slack ping (last-known caller details);
+      // by the time the rep clicks, the actual head may be a different
+      // caller. Twilio's queue serializes FIFO; the rep just clicks Join
+      // and gets bridged to whoever is at the head.
+      headingEl.textContent = 'Basic Capital — Take Next Caller (queue)';
+      metaEl.textContent = 'Dequeues the head-of-queue caller from the bc-support queue.';
+      joinBtn.textContent = 'Take next caller';
+      if (!customer) customerEl.textContent = '(head of queue — actual caller revealed on bridge)';
+      else customerEl.textContent = customer + ' (last known; head may differ)';
+      intentEl.textContent = intent || '(unknown)';
+      if (customer) fallbackEl.hidden = false;
+    } else {
+      // v1 / legacy: named conference.
+      confEl.textContent = conf || '(missing)';
+      customerEl.textContent = customer || '(unknown — older Slack link)';
+      intentEl.textContent = intent || '(unknown)';
+      if (customer) fallbackEl.hidden = false;
+      if (!conf) {
+        joinBtn.disabled = true;
+        logEl.textContent = 'No conference name in URL. Open the link from the Slack button.';
+        logEl.classList.add('err');
+      }
     }
 
     let device, call, watchdog, connected = false;
@@ -119,8 +141,14 @@
         device = new Twilio.Device(token, { codecPreferences: ['opus', 'pcmu'] });
         device.on('error', (e) => log('Device error: ' + (e && e.message || e), 'err'));
 
-        log('Connecting to conference...');
-        call = await device.connect({ params: { conference: conf } });
+        // Mode-aware connect: queue mode passes `mode=queue` to the
+        // TwiML App, which returns <Dial><Queue> TwiML; legacy mode
+        // passes the conference name and gets <Dial><Conference> TwiML.
+        const connectParams = mode === 'queue'
+          ? { mode: 'queue' }
+          : { conference: conf };
+        log(mode === 'queue' ? 'Dequeuing next caller...' : 'Connecting to conference...');
+        call = await device.connect({ params: connectParams });
         call.on('accept', () => {
           connected = true;
           clearWatchdog();
