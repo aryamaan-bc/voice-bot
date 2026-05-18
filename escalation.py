@@ -451,23 +451,50 @@ async def run_escalation_flow(
         os.environ.get("BROWSER_PICKUP", "").strip().lower()
         in ("1", "true", "yes")
     )
+    queue_version = (os.environ.get("QUEUE_VERSION", "v2").strip().lower() or "v2")
 
     slot_acquired = False
     queued_then_dispatched = False
 
     try:
         logger.info(
-            "escalation flow START call_id=%s intent=%r",
+            "escalation flow START call_id=%s intent=%r queue_version=%s",
             call_id,
             intent_summary,
+            queue_version,
         )
 
-        # Step 0 — queue admission. Only in business hours, only in
-        # browser-pickup mode (queued dispatch requires the per-call
-        # conference + force-redirect path; legacy cell-probe path
-        # doesn't support graceful queueing). If QUEUE_ENABLED=false
-        # OR after-hours OR no-browser-pickup, the existing behavior
-        # runs unchanged.
+        # Step 0a — v2 (Twilio Enqueue) handoff. When QUEUE_ENABLED=true,
+        # QUEUE_VERSION=v2, business hours, browser-pickup mode: the
+        # customer's call leg moves out to Twilio for the entire hold +
+        # dispatch flow. Cartesia speaks one announcement and returns;
+        # Twilio handles the rest (hold music, position updates, press-1
+        # voicemail, rep dispatch via <Dial><Queue>).
+        #
+        # Rollback: set QUEUE_VERSION=v1 in env → falls through to v1
+        # in-Cartesia silent-hold logic below. No code redeploy needed.
+        if (
+            _queue_enabled()
+            and queue_version == "v2"
+            and browser_pickup_for_admit
+            and not after_hours
+        ):
+            async for ev in _run_v2_queue_handoff(
+                call_id=call_id,
+                caller_number=caller_number,
+                intent_summary=intent_summary,
+                spoken_announcement=spoken_announcement,
+                escalation_status=escalation_status,
+            ):
+                yield ev
+            return
+
+        # Step 0b — v1 in-Cartesia queue admission. Only in business
+        # hours, only in browser-pickup mode (queued dispatch requires
+        # the per-call conference + force-redirect path; legacy
+        # cell-probe path doesn't support graceful queueing). If
+        # QUEUE_ENABLED=false OR after-hours OR no-browser-pickup, the
+        # existing behavior runs unchanged.
         if _queue_enabled() and browser_pickup_for_admit and not after_hours:
             if await hold_queue.try_admit():
                 slot_acquired = True
@@ -998,6 +1025,152 @@ async def _delayed_force_redirect(
         )
     if completed_flag is not None:
         completed_flag[0] = True
+
+
+async def _redirect_to_queue(call_id: str, caller_number: str, intent_summary: str) -> bool:
+    """v2 entry: Twilio REST `call.update` to replace the customer's
+    call-leg TwiML with the <Enqueue> response from /enqueue-customer.
+    After this fires, the customer's call leg is in Twilio's queue
+    (hearing hold music + position updates); Cartesia's WebSocket closes
+    within ~1s. From that point, the /queue-action Function is
+    authoritative for the outcome ticket — main.py's CallEnded handler
+    sees phase=queue_handoff and suppresses its own abandoned ticket.
+
+    Returns True on REST success, False on failure. The caller falls
+    through to in-Cartesia callback intake on failure (preserves the
+    "no caller asking for human ends call without team notification"
+    invariant).
+    """
+    functions_domain = os.environ.get("TWILIO_FUNCTIONS_DOMAIN", "").strip()
+    if not functions_domain:
+        logger.warning("TWILIO_FUNCTIONS_DOMAIN unset — can't enqueue via REST")
+        return False
+
+    twilio_sid = _env("TWILIO_ACCOUNT_SID")
+    twilio_token = _env("TWILIO_AUTH_TOKEN")
+    twilio_call_sid = call_id[3:] if call_id.startswith("ac_") else call_id
+    params = "&".join([
+        f"call_id={quote(call_id)}",
+        f"caller={quote(caller_number)}",
+        f"intent={quote(intent_summary[:200])}",
+    ])
+    enqueue_url = f"https://{functions_domain}/enqueue-customer?{params}"
+
+    client = Client(twilio_sid, twilio_token)
+    try:
+        await asyncio.to_thread(
+            client.calls(twilio_call_sid).update,
+            method="POST",
+            url=enqueue_url,
+        )
+        logger.info(
+            "v2 enqueue redirect: call=%s -> /enqueue-customer (queue=bc-support)",
+            twilio_call_sid,
+        )
+        return True
+    except Exception as e:
+        logger.warning(
+            "v2 enqueue redirect FAILED (non-fatal — falling through to callback intake): %s",
+            e,
+        )
+        return False
+
+
+async def _run_v2_queue_handoff(
+    *,
+    call_id: str,
+    caller_number: str,
+    intent_summary: str,
+    spoken_announcement: str,
+    escalation_status,
+):
+    """v2 queue path: speak one announcement, post Slack ping with
+    `?mode=queue` URL, fire the escalation_pending Linear ticket, then
+    REST-update the customer's call leg into the Twilio queue. After the
+    REST call returns success, Cartesia's session ends (the customer's
+    call is now in Twilio). We `return` here; main.py's CallEnded
+    handler sees `phase == "queue_handoff"` and suppresses the abandoned
+    ticket so /queue-action can own the final outcome.
+
+    On REST failure (Twilio outage, dead call, etc.), yield the
+    callback-intake message and return — same fallback as v1's
+    probe-failure path. Phase stays at queue_handoff during fallback;
+    main.py CallEnded will still suppress, but the LLM intake flow
+    will set phase=idle once record_followup fires.
+    """
+    if escalation_status is not None:
+        escalation_status["phase"] = "queue_handoff"
+
+    # Step 1 — announcement. Caller hears one short sentence in
+    # Cartesia's voice before being moved out to Twilio. The Twilio
+    # hold music takes over immediately after.
+    yield AgentSendText(text=spoken_announcement, interruptible=False)
+
+    # Step 2 — Slack ping with the v2 pickup URL (?mode=queue). Button
+    # opens agent-pickup.html in queue mode → click Join → TwiML App
+    # invokes /agent-dial with mode=queue → <Dial><Queue> bridges to
+    # the head-of-queue caller. FIFO + atomicity provided by Twilio.
+    functions_domain = os.environ.get("TWILIO_FUNCTIONS_DOMAIN", "").strip()
+    pickup_url: Optional[str] = None
+    if functions_domain:
+        pickup_url = (
+            f"https://{functions_domain}/agent-pickup.html"
+            f"?mode=queue"
+            f"&customer={quote(caller_number)}"
+            f"&intent={quote(intent_summary[:140])}"
+        )
+    slack_url = os.environ.get("SLACK_WEBHOOK_URL", "")
+    if slack_url:
+        try:
+            await _send_slack_ping(
+                slack_url,
+                intent_summary,
+                caller_number,
+                demo_mode=False,
+                pickup_url=pickup_url,
+                after_hours=False,
+            )
+        except Exception as e:
+            logger.warning("v2 Slack ping failed (non-fatal): %s", e)
+
+    # Step 3 — Linear escalation_pending ticket. Pinned background task
+    # so generator cancellation (which fires soon after the REST update)
+    # doesn't drop the ticket.
+    pending_task = asyncio.create_task(
+        log_escalation_started(
+            call_id=call_id,
+            caller_number=caller_number,
+            intent_summary=intent_summary,
+        )
+    )
+    _ACTIVE_PROBE_TASKS.add(pending_task)
+    pending_task.add_done_callback(_ACTIVE_PROBE_TASKS.discard)
+
+    # Step 4 — let the announcement play before we redirect (TTS finish
+    # estimate based on word count). Without this beat the REST update
+    # cuts audio mid-sentence.
+    word_count = len(spoken_announcement.split())
+    announcement_budget = min(6.0, 0.4 * word_count + 0.5)
+    await asyncio.sleep(announcement_budget)
+
+    # Step 5 — REST call.update. On success, Cartesia session ends
+    # shortly; on failure, fall through to in-Cartesia callback intake.
+    ok = await _redirect_to_queue(call_id, caller_number, intent_summary)
+    if ok:
+        logger.info("v2 handoff complete — Twilio now owns call_id=%s", call_id)
+        return
+
+    logger.error(
+        "v2 redirect failed — falling through to in-Cartesia callback intake call_id=%s",
+        call_id,
+    )
+    if escalation_status is not None:
+        # Drop back to probe-style phase so the in-Cartesia callback
+        # intake flow runs cleanly (record_followup's phase==idle gate
+        # will pass once the LLM completes intake and phase is reset).
+        escalation_status["phase"] = "probe_wait"
+    async for ev in _yield_callback_intake_message():
+        yield ev
 
 
 async def _force_redirect_to_conference(client, call_id: str, conf_name: str) -> bool:

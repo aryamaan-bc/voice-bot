@@ -762,6 +762,20 @@ async def get_agent(env: AgentEnv, call_request: CallRequest):
         turn_env: TurnEnv, event: InputEvent
     ) -> AsyncIterable[OutputEvent]:
         if isinstance(event, CallEnded) and not completed[0]:
+            # v2: if the call ended because the customer was just
+            # redirected to the Twilio queue, the Twilio /queue-action
+            # Function is now authoritative for the outcome ticket
+            # (transferred / abandoned_in_queue / voicemail_logged
+            # depending on what happens in the queue). Suppress
+            # Cartesia's abandoned ticket so we don't double-log.
+            if escalation_status["phase"] == "queue_handoff":
+                logger.info(
+                    "Call %s ended; v2 queue_handoff complete — Twilio /queue-action owns the outcome ticket",
+                    call_id,
+                )
+                completed[0] = True
+                return
+
             # Case 10: if the caller hung up while queued, log the more
             # specific abandoned_in_queue outcome (for capacity-planning
             # analytics) and dequeue the entry so it doesn't block the
@@ -847,22 +861,22 @@ async def get_agent(env: AgentEnv, call_request: CallRequest):
                     yield ev_out
                 return
 
-        # During the probe wait, suppress LLM dispatch for user turns.
-        # The flow plays its own filler audio every ~10s; letting the
-        # LLM also respond queues overlapping speech ("I'm connecting
-        # you to the team" right behind a filler with no pause). The
-        # system prompt instructs the LLM to stay silent, but Haiku
-        # is unreliable about it under drift — this is the code-level
-        # enforcement. Tools the LLM might call are guarded by their
-        # own phase checks too.
+        # During the probe wait (v1) OR queue handoff window (v2),
+        # suppress LLM dispatch for user turns. v1 probe-wait plays its
+        # own filler audio every ~10s; letting the LLM also respond
+        # queues overlapping speech. v2 queue_handoff is a brief (~3-6s)
+        # window between the announcement firing and the REST
+        # call.update redirecting the customer to Twilio; any LLM
+        # response in that window would speak just as the Cartesia
+        # session is closing.
         #
-        # During queue_wait we DO NOT suppress: the bot is mostly
-        # quiet (one position update per ~45s), so the LLM is free to
-        # answer FAQ questions or route the caller into record_followup
-        # if they ask to opt out of the queue.
+        # During queue_wait (v1 silent-hold) we do NOT suppress — the
+        # bot is mostly quiet (one position update per ~45s), so the
+        # LLM is free to answer FAQ questions or route the caller into
+        # record_followup if they ask to opt out of the queue.
         if (
             isinstance(event, UserTurnEnded)
-            and escalation_status["phase"] == "probe_wait"
+            and escalation_status["phase"] in ("probe_wait", "queue_handoff")
         ):
             logger.info(
                 "Suppressing LLM dispatch (call=%s) — probe wait in progress",
