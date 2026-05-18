@@ -260,13 +260,20 @@ async def _wait_in_queue(
             logger.warning("queue-entry Slack ping failed (non-fatal): %s", e)
 
     update_interval = _int_env("QUEUE_POSITION_UPDATE_INTERVAL_SECONDS", 45)
-    max_wait = _int_env("MAX_QUEUE_WAIT_SECONDS", 300)
+    checkin_interval = _int_env("QUEUE_CHECKIN_INTERVAL_SECONDS", 180)
+    max_wait = _int_env("MAX_QUEUE_WAIT_SECONDS", 900)
     started = time.monotonic()
+    last_position_update_at = started
+    last_checkin_at = started
 
     while True:
-        elapsed = time.monotonic() - started
+        now = time.monotonic()
+        elapsed = now - started
         if elapsed >= max_wait:
-            # Case 11: hard-timeout → callback intake.
+            # Case 11: hard-timeout safety floor → callback intake.
+            # Acts as a backstop for forgotten-phone-on-desk scenarios.
+            # In normal use the periodic check-ins should give the
+            # caller an explicit opt-out well before this fires.
             logger.info(
                 "queue hard-timeout call_id=%s elapsed=%.0fs", call_id, elapsed
             )
@@ -276,18 +283,49 @@ async def _wait_in_queue(
             escalation_status["phase"] = "idle"
             return
 
+        # Compute when each timer next needs to fire and wait for the
+        # earliest event (dispatch / position update / check-in / max).
+        time_to_position_update = (last_position_update_at + update_interval) - now
+        time_to_checkin = (last_checkin_at + checkin_interval) - now
+        time_to_max = max_wait - elapsed
+        wait_for_timeout = max(0.1, min(
+            time_to_position_update, time_to_checkin, time_to_max
+        ))
+
         try:
             dispatched = await asyncio.wait_for(
                 hold_queue.wait_for_dispatch(call_id, completed_flag),
-                timeout=min(update_interval, max_wait - elapsed),
+                timeout=wait_for_timeout,
             )
         except asyncio.TimeoutError:
+            now = time.monotonic()
             new_pos = await hold_queue.position(call_id)
-            if new_pos is not None:
+            if new_pos is None:
+                continue  # already dequeued (record_followup opt-out, etc.)
+            # Check-in supersedes a regular position update at the
+            # 3-min / 6-min / etc. boundaries. Gives the caller an
+            # explicit opt-out without making the bot nag every 45s.
+            if now >= last_checkin_at + checkin_interval:
+                yield AgentSendText(
+                    text=(
+                        f"Still here — you're number {new_pos} in line. "
+                        f"Want to keep waiting, or should I take a "
+                        f"message and have someone call you back?"
+                    ),
+                    interruptible=False,
+                )
+                last_checkin_at = now
+                # Reset position-update timer too — we just talked
+                # about position, no need for another update 1s later.
+                last_position_update_at = now
+            elif now >= last_position_update_at + update_interval:
                 yield AgentSendText(
                     text=f"Still here with you — you're number {new_pos} in line.",
                     interruptible=False,
                 )
+                last_position_update_at = now
+            # else: timer was clamped (e.g., max_wait approaching) —
+            # just loop and let the elapsed check fire next iteration.
             continue
 
         if not dispatched:

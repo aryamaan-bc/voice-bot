@@ -419,13 +419,22 @@ line"). The wait can be several minutes.
 
 During queue wait you DO get user turns and CAN respond. The rules:
 
-- Caller asks a FAQ question → answer it briefly (1-2 sentences, same \
-as normal FAQ chat). Don't promise transfer timing — the wait could \
-still be several minutes.
+- Every few minutes the bot proactively asks "want to keep waiting, \
+or should I take a message and have someone call you back?" — this \
+is NOT something you say; the queue tool speaks it on its own. Your \
+job is to handle the caller's response:
+    - "Keep waiting" / "I'll wait" / "yes" / "yeah" / similar → brief \
+      "Got it, hanging tight." That's it. No tool call.
+    - "Take a message" / "callback" / "no" / "I don't want to wait" → \
+      call record_followup. The tool dequeues them and runs the \
+      standard callback intake flow.
+- Caller asks a FAQ question (unprompted, not in response to a \
+check-in) → answer it briefly (1-2 sentences, same as normal FAQ \
+chat). Don't promise transfer timing — the wait could still be \
+several minutes.
 - Caller says they'd rather just leave their info ("just take a \
 message", "have them call me back", "I don't want to wait") → call \
-record_followup. The tool dequeues them from the queue and runs the \
-standard callback intake flow.
+record_followup. Same as the check-in opt-out path.
 - Caller asks "are you still there?" or similar reassurance → brief \
 "Yes, still here with you — you're in line and we'll connect as soon \
 as we can." Don't promise a specific time.
