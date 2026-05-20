@@ -1,5 +1,6 @@
 """Basic Capital FAQ voice agent — entry point."""
 
+import asyncio
 import logging
 import os
 from datetime import datetime
@@ -34,7 +35,7 @@ from line.voice_agent_app import AgentEnv, CallRequest, VoiceAgentApp
 import hold_queue
 from escalation import make_escalate_tool, run_escalation_flow, user_wants_human
 from linear_ticket import log_call_complete
-from slack_ticket import make_followup_tool
+from slack_ticket import make_followup_tool, send_inbound_call_ping
 
 
 # Recovery farewell used when end_call_with_goodbye fires while an
@@ -701,6 +702,25 @@ async def get_agent(env: AgentEnv, call_request: CallRequest):
         call_request.from_,
         after_hours,
     )
+
+    # Inbound-call Slack notification — fires for EVERY call (including
+    # FAQ-only calls that never escalate). Gives the team live awareness
+    # of call volume during burn-in. Fire-and-forget: a Slack outage or
+    # latency must NOT delay the agent setup, otherwise the caller hears
+    # silence on pickup.
+    slack_webhook = os.environ.get("SLACK_WEBHOOK_URL", "").strip()
+    if slack_webhook:
+        async def _fire_inbound_ping():
+            try:
+                await send_inbound_call_ping(
+                    slack_webhook,
+                    caller_number=call_request.from_ or "",
+                    call_id=call_request.call_id,
+                    after_hours=after_hours,
+                )
+            except Exception as e:
+                logger.warning("inbound-call Slack ping failed (non-fatal): %s", e)
+        asyncio.create_task(_fire_inbound_ping())
 
     # Single-element list as a mutable closure cell shared between the
     # tools that end a call cleanly (end_call_with_goodbye, the transfer

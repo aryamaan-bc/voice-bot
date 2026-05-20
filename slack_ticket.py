@@ -243,6 +243,56 @@ async def send_queue_entry_ping(
     )
 
 
+async def send_inbound_call_ping(
+    webhook_url: str,
+    *,
+    caller_number: str,
+    call_id: str,
+    after_hours: bool,
+) -> None:
+    """Notify the team that a new inbound call has connected to the bot.
+
+    Fires from main.get_agent on every inbound call — including FAQ-only
+    calls that never escalate. Lightweight informational ping so the
+    team has live awareness of call volume + can jump into the Cartesia
+    dashboard for any call that catches their eye.
+
+    No buttons, no Linear ticket here. Escalation pings (with the "Open
+    Rep Dashboard" button + escalation_pending Linear ticket) fire
+    separately from escalation.py if the caller asks for a human.
+
+    Failures are non-fatal — caller is dialed back so a Slack outage
+    must not block the call from connecting.
+    """
+    agent_id = os.environ.get("CARTESIA_AGENT_ID", "").strip()
+    deeplink = ""
+    if agent_id and call_id:
+        # Cartesia's dashboard expects `ac_`-prefixed call IDs even
+        # though CallRequest.call_id arrives without the prefix.
+        call_id_for_url = call_id if call_id.startswith("ac_") else f"ac_{call_id}"
+        deeplink = (
+            f"\n<https://play.cartesia.ai/agents/{agent_id}"
+            f"?tab=calls&call={call_id_for_url}|View live in Cartesia dashboard>"
+        )
+
+    icon = ":moon:" if after_hours else ":telephone_receiver:"
+    mode_label = "after-hours" if after_hours else "business hours"
+    payload = {
+        "text": (
+            f"{icon} *BC inbound call* ({mode_label})\n"
+            f"*From:* {caller_number or '(unknown)'}"
+            f"{deeplink}"
+        )
+    }
+    async with httpx.AsyncClient(timeout=5) as client:
+        resp = await client.post(webhook_url, json=payload)
+    resp.raise_for_status()
+    logger.info(
+        "inbound-call Slack ping sent (status=%s, after_hours=%s)",
+        resp.status_code, after_hours,
+    )
+
+
 def _email_fallback_instruction(caller_name: str = "") -> str:
     """When Slack fails, return the exact wording for the bot to speak.
     No meta prefix — the system prompt tells the LLM to speak the return
