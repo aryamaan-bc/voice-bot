@@ -481,21 +481,28 @@ names (e.g., "John Smith", "Sarah Johnson"), no need to spell.
 number to reach you at?" ALWAYS have them say the number explicitly — \
 don't reuse the number they're calling from. Read it back to confirm.
 
-3. Call record_followup:
+3. Then ask for the reason / message: "And what would you like the \
+team to know about your call?" Wait for their response. ALWAYS ask \
+this explicitly — even if you already have rough context from earlier \
+in the call (e.g., they said "I have a 401k question"), still ask, \
+because the team needs the caller's own words for the message. Use \
+their answer near-verbatim for the `intent_summary` parameter below.
+
+4. Call record_followup:
 
     record_followup(
         caller_name="<name>",
         contact_method="phone",
-        intent_summary="<one-sentence summary of what they wanted>",
+        intent_summary="<the message they just dictated, in their own words>",
         callback_number="<number>"
     )
 
-4. The tool's return value is the EXACT sentence to speak back to the \
+5. The tool's return value is the EXACT sentence to speak back to the \
 caller — it already includes the "anything else?" close. Speak it \
 VERBATIM. Don't paraphrase, don't add anything on top, don't ask \
 "anything else?" again separately.
 
-5. If the caller has nothing else, call end_call_with_goodbye with \
+6. If the caller has nothing else, call end_call_with_goodbye with \
 outcome="callback_logged".
 
 IMPORTANT: call record_followup BEFORE the confirmation speech, so a \
@@ -683,6 +690,31 @@ def _is_within_business_hours(now: datetime) -> bool:
     return start_hour <= local.hour < end_hour
 
 
+def _today_context_block() -> str:
+    """Tiny prompt prefix giving the LLM today's date + day of week, plus
+    a hard rule against committing to a specific callback day.
+
+    Built per call (not module-load) so SYSTEM_PROMPT can stay static
+    while the bot's sense of "today" stays current across a long-lived
+    container. Day-name bans are belt-and-suspenders: even if the LLM
+    knows it's Wednesday, it should still defer to record_followup's
+    hardcoded "within one business day" wording rather than predicting
+    a specific day to the caller (LLMs hallucinate dates).
+    """
+    tz = ZoneInfo(os.environ.get("BUSINESS_HOURS_TZ", "America/New_York"))
+    now = datetime.now(tz=tz)
+    return (
+        "# Today (Eastern time)\n"
+        f"Today is {now.strftime('%A, %B %d, %Y')}. Use this for grounding "
+        "anything time-related the caller says.\n\n"
+        "**Do NOT predict callback timing by day name to the caller.** "
+        "Don't say \"we'll call you Monday\" / \"Tuesday morning\" / "
+        "\"tomorrow at 2pm\" — even after-hours where it might feel "
+        "natural. The record_followup tool's confirmation says "
+        "\"within one business day\" — let that be the only commitment.\n\n"
+    )
+
+
 # === Agent factory =========================================================
 
 
@@ -760,7 +792,11 @@ async def get_agent(env: AgentEnv, call_request: CallRequest):
             ),
         ],
         config=LlmConfig(
-            system_prompt=SYSTEM_PROMPT + (AFTER_HOURS_PROMPT_NOTE if after_hours else ""),
+            system_prompt=(
+                _today_context_block()
+                + SYSTEM_PROMPT
+                + (AFTER_HOURS_PROMPT_NOTE if after_hours else "")
+            ),
             introduction=AFTER_HOURS_GREETING if after_hours else GREETING,
         ),
     )
