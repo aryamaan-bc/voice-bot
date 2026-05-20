@@ -27,6 +27,25 @@ What's bundled in this deploy (everything that landed on queue-v1):
 - **Caller intent on dashboard**: Twilio Sync Map (`bc-call-intent`)
   keyed by Twilio CallSid; populated by `/enqueue-customer`, read by
   `/dashboard-state`, rendered as "Wants: …" on each card
+- **Inbound-call Slack ping**: Slack DM the team on every inbound call
+  (including FAQ-only ones), with a Cartesia dashboard deep-link.
+  Fires from `main.get_agent` as a fire-and-forget task.
+- **After-hours dedup**: in-after-hours escalation no longer plays the
+  LLM-supplied announcement on top of `AFTER_HOURS_UNAVAILABLE_MESSAGE`
+  (the caller was hearing "Let me grab your name…" twice in a row).
+- **Bug fixes surfaced during staging burn-in** (all bundled into the
+  same deploy, no separate phase needed):
+  - `queue-action.js` handles `QueueResult=redirected` (v2.1 pickups
+    now correctly fire the `transferred` Linear ticket — the
+    `escalation_pending` ticket no longer sits "pending" forever)
+  - `dashboard.html` Join-this-call button HTML-escaping fix
+    (multi-rep join was a no-op before this)
+  - `agent-dial.js` adds `statusCallback` to the rep's `<Conference>`
+    verb (required for the v2.4 auto-hangup to fire when the rep
+    drops first — without it the customer was stranded)
+  - `escalation.py` finally-block preserves `queue_handoff` /
+    `queue_wait` phase signals so `main.py` CallEnded picks the right
+    outcome ticket instead of logging a duplicate `abandoned`
 
 **Estimated time:** 30-45 minutes of attentive work. Plan to be at the
 keyboard the whole time; do not start during peak call hours.
@@ -664,6 +683,10 @@ should be unchanged from pre-deploy.
 
 Dial `+1 (888) 460-4901` from a test phone:
 
+- [ ] **Inbound-call Slack DM lands** in `#bc_customer_calls`
+      immediately on pickup (📞 BC inbound call ... + Cartesia
+      deep-link). New as of this deploy — see Phase 8 note about
+      tuning frequency if it gets noisy.
 - [ ] Bot greets normally (Cartesia voice — same as before)
 - [ ] Ask an FAQ ("What's the 401(k) contribution limit?") → bot
       answers correctly
@@ -800,10 +823,39 @@ they land in an empty conference (the customer's TwiML has changed by
 that point — known edge case, see CLAUDE.md "Trade-off" note in
 conference-status.js).
 
-### 7.7 — Verify no Twilio errors
+### 7.7 — Verify no duplicate Linear tickets
 
-Same alerts check as Phase 6.2. No new 11200 / 12200 / 12300 after the
-v2 test calls.
+After Phase 7.3 (rep picks up + you hang up the phone), check Linear:
+
+- [ ] **Exactly TWO tickets** for the test call:
+      `Escalation started — outcome pending` AND `Transferred to human`.
+- [ ] **NO** third ticket with `Caller hung up mid-call` /
+      `abandoned`. (If you see one, the phase-preserve fix in
+      escalation.py didn't make it onto the prod deploy — re-check
+      Phase 5.)
+
+After Phase 7.4 (press-1 voicemail):
+
+- [ ] Exactly TWO tickets: `Escalation started — outcome pending`
+      AND `Voicemail logged`.
+
+After Phase 7.5 if you abandoned in-queue:
+
+- [ ] Exactly TWO tickets: `Escalation started — outcome pending`
+      AND `Caller hung up while queued` (`abandoned_in_queue`).
+
+### 7.8 — Verify no Twilio errors
+
+In Twilio Console → Monitor → Logs → Errors, filter to the last 30
+minutes. No new entries with code:
+
+- [ ] 11200 (HTTP retrieval failure) — would indicate a Function
+      returned 5xx or an Asset 404'd
+- [ ] 12200 (Schema validation failed) — invalid TwiML
+- [ ] 12300 (Invalid Content-Type)
+- [ ] 82004 (Function warning) — should be empty; the `redirected`
+      branch fix in queue-action.js silences the one that fired on
+      every v2.1 pickup during staging burn-in
 
 ---
 
@@ -811,10 +863,17 @@ v2 test calls.
 
 Leave prod on v2 for a few real calls / a day. Monitor:
 
-- Slack `#bc_customer_calls` for queue pings + voicemail DMs
-- Linear ticket outcomes — distribution should be similar to v1 except
-  with new `voicemail_logged` and `abandoned_in_queue` outcomes
-- Twilio alerts (Monitor → Alerts in console) — should be quiet
+- Slack `#bc_customer_calls` for: (a) **inbound-call DMs** (📞 fires
+  on every pickup — including FAQ-only; if this is too noisy in
+  production after a day, see "Cleanup" below for the toggle), (b)
+  queue-entry DMs (when a caller escalates), (c) recording DMs
+  (post-call audio link).
+- Linear ticket outcomes — exactly TWO tickets per escalated call
+  (`escalation_pending` paper-trail floor + one of `transferred` /
+  `voicemail_logged` / `abandoned_in_queue` for the final outcome).
+  Any third "abandoned" ticket on an escalated call indicates the
+  phase-preserve fix didn't make it to prod.
+- Twilio Console → Monitor → Logs → Errors — should be quiet.
 
 If anything looks off:
 
@@ -835,6 +894,14 @@ entirely, returns to the pre-queue probe-based flow.
 ---
 
 ## Cleanup / things to track post-deploy
+
+- **Inbound-call Slack DM volume** — fires on every call including
+  FAQ-only ones; intentionally turned on during burn-in for live
+  awareness, but the team may want to dial this back at scale. Two
+  ways to silence: (a) remove the `asyncio.create_task(_fire_inbound_ping())`
+  block in `main.get_agent` (Cartesia redeploy required), or (b) point
+  the team's `SLACK_WEBHOOK_URL` at a quieter channel and keep the
+  noisy one for the inbound-call pings. No env-var toggle today.
 
 - **Twilio signature validation** on Functions — pre-existing gap.
   Worth fixing in a separate hardening pass. Public Asset URLs
@@ -889,4 +956,8 @@ entirely, returns to the pre-queue probe-based flow.
 - [ ] Phase 7: QUEUE_ENABLED flipped to true
 - [ ] Phase 7.3-7.6: test calls confirm v2 path + dashboard + voicemail
       + auto-hangup all work end-to-end
+- [ ] Phase 7.7: exactly TWO Linear tickets per escalated call
+      (escalation_pending + outcome); no duplicate `abandoned`
+- [ ] Phase 7.8: Twilio Errors quiet (no new 11200 / 12200 / 12300 /
+      82004 entries)
 - [ ] Phase 8: burn-in
