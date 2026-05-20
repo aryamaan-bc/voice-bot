@@ -163,15 +163,25 @@
                 ? '<div class="intent">Wants: ' + escapeHtml(c.intent) + '</div>'
                 : '') +
               '<div class="conf">Conference: ' + escapeHtml(c.conferenceName) + '</div>' +
-              '<button class="action secondary" ' +
-                'onclick="joinCall(' + JSON.stringify(c.conferenceName) + ', ' +
-                                       JSON.stringify(c.callerNumber) + ')">' +
+              // Use data-* attributes + event delegation below instead
+              // of inline onclick. JSON.stringify(...) injected into an
+              // onclick="..." attribute breaks the attribute's quoting
+              // (inner double quotes close the attribute prematurely,
+              // so the handler never fires).
+              '<button class="action secondary join-btn" ' +
+                'data-conf="' + escapeHtml(c.conferenceName) + '" ' +
+                'data-customer="' + escapeHtml(c.callerNumber) + '">' +
                 'Join this call' +
               '</button>' +
             '</div>'
           );
         }
         aList.innerHTML = parts.join('');
+        aList.querySelectorAll('.join-btn').forEach((btn) => {
+          btn.addEventListener('click', () => {
+            joinCall(btn.dataset.conf, btn.dataset.customer);
+          });
+        });
       }
     }
 

@@ -9,17 +9,24 @@
  *                conversation continues regardless of what we return.
  *                Action: log Linear `transferred`. Return <Hangup/> as
  *                a no-op (bridged leg is already its own thing).
+ *                (Pre-v2.1 path; not used by current code — kept for
+ *                rollback compatibility.)
+ *
+ *   redirected — REST API redirected the queue member out via
+ *                Members.update(url=/conference-join). This is the v2.1
+ *                conference-on-bridge path: agent-dial.js dequeues the
+ *                head and points them at /conference-join, which drops
+ *                them into a bc-active-<id> conference. Same outcome
+ *                as bridged from the customer's perspective — they're
+ *                transferred to a rep — so log Linear `transferred`.
  *
  *   hangup     — caller hung up while queued (no rep ever clicked).
  *                Action: log Linear `abandoned_in_queue`.
  *
  *   leave      — <Leave/> verb fired (hard-timeout in /queue-wait, or
- *                press-1 redirecting in some Twilio configurations).
+ *                press-1 via /queue-leave).
  *                Action: redirect to /queue-press to start the
  *                voicemail-intake chain.
- *
- *   redirected — REST API redirected the queue member out (unused for
- *                us today). Treat as a no-op log.
  *
  * Query params propagated from /enqueue-customer: call_id, caller, intent.
  *
@@ -97,16 +104,22 @@ exports.handler = async (context, event, callback) => {
 
   const twiml = new Twilio.twiml.VoiceResponse();
 
-  if (queueResult === 'bridged') {
+  if (queueResult === 'bridged' || queueResult === 'redirected') {
+    // bridged    = legacy <Dial><Queue> pickup (pre-v2.1; kept for rollback)
+    // redirected = v2.1 REST Members.update pickup into bc-active-* conference
+    // Both mean: customer left queue heading toward a rep. Same Linear outcome.
+    const recap = queueResult === 'bridged'
+      ? `Caller bridged to rep via <Dial><Queue> after ${queueTime}s in queue.`
+      : `Caller redirected from queue to bc-active conference after ${queueTime}s. Rep on the call.`;
     await logLinearTicket(context, {
       outcome: 'transferred',
       caller,
       intent,
-      recap: `Caller bridged to rep via <Dial><Queue> after ${queueTime}s in queue.`,
+      recap,
       callId,
     });
-    // Bridged leg already runs in its own <Dial> context; our TwiML
-    // response here is a no-op. Hangup just closes this handler turn.
+    // Customer's call leg is already routed elsewhere (Dial subcall or
+    // conference). Our TwiML response is a no-op.
     twiml.hangup();
     return callback(null, twiml);
   }

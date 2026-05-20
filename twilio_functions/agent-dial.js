@@ -193,11 +193,19 @@ exports.handler = async function (context, event, callback) {
     // re-configure it here. endConferenceOnExit:false so this rep
     // leaving doesn't kick the customer out — the customer's leg has
     // endConferenceOnExit:true so the conf only ends when THEY hang up.
+    //
+    // statusCallback wired on the rep's leg so /conference-status fires
+    // when the rep drops. Without this, the customer is stranded in
+    // silence (their leg's statusCallback only fires for customer
+    // events, not rep events — Twilio statusCallbacks are per-leg).
     twiml.dial().conference(
       {
         startConferenceOnEnter: true,
         endConferenceOnExit: false,
         beep: false,
+        statusCallback: `https://${context.DOMAIN_NAME}/conference-status`,
+        statusCallbackEvent: 'leave',
+        statusCallbackMethod: 'POST',
       },
       confName
     );
@@ -220,11 +228,17 @@ exports.handler = async function (context, event, callback) {
     return callback(null, twiml);
   }
 
+  // Same statusCallback rationale as the mode=queue branch — fires
+  // /conference-status when the rep drops so a stranded customer gets
+  // the 30s wind-down + auto-hangup.
   twiml.dial().conference(
     {
       startConferenceOnEnter: true,
       endConferenceOnExit: false,
       beep: false,
+      statusCallback: `https://${context.DOMAIN_NAME}/conference-status`,
+      statusCallbackEvent: 'leave',
+      statusCallbackMethod: 'POST',
     },
     confName
   );
