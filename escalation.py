@@ -829,12 +829,27 @@ async def run_escalation_flow(
             async for ev in _yield_callback_intake_message(after_hours=after_hours):
                 yield ev
     finally:
-        # Always reset phase to "idle", even if the generator is cancelled
-        # mid-flow by an LLM hijack. This way end_call_with_goodbye
-        # firing after a hijack-and-give-up correctly sees "not in
-        # escalation anymore" and ends normally.
+        # Reset phase to "idle" so end_call_with_goodbye firing after a
+        # hijack-and-give-up correctly sees "not in escalation anymore"
+        # and ends normally — BUT preserve the two phases that main.py's
+        # CallEnded handler needs to read:
+        #   - "queue_handoff": caller is in Twilio queue. /queue-action
+        #     owns the outcome ticket. main.py CallEnded must see this
+        #     to suppress its own abandoned ticket. Without preservation,
+        #     every v2 queue call generates a duplicate "abandoned"
+        #     ticket alongside the legitimate queue-action one.
+        #   - "queue_wait": caller is in v1 silent-hold queue. If they
+        #     hang up, main.py CallEnded must see this to fire the
+        #     specific abandoned_in_queue ticket + dequeue, not the
+        #     generic "Caller hung up mid-call" ticket.
+        # In both cases the call has effectively left Cartesia's
+        # control — the LLM has no chance to call end_call_with_goodbye
+        # (queue_handoff has dispatch suppression; queue_wait has
+        # _wait_in_queue's own guard), so leaving phase set here is
+        # safe.
         if escalation_status is not None:
-            escalation_status["phase"] = "idle"
+            if escalation_status["phase"] not in ("queue_handoff", "queue_wait"):
+                escalation_status["phase"] = "idle"
         if slot_acquired:
             # Match the increment from try_admit() or wait_for_dispatch()
             # so the queue's MAX_CONCURRENT_REPS bookkeeping stays
