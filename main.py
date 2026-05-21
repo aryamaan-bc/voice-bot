@@ -187,8 +187,18 @@ logger = logging.getLogger(__name__)
 
 
 # === Knowledge base ========================================================
-# Loaded once per container at import. Edits require a redeploy.
-FAQS = (Path(__file__).parent / "faqs.md").read_text()
+# Two FAQ files, two audiences. Both are loaded into the system prompt; the
+# bot disambiguates at the greeting (see GREETING below) and uses the
+# appropriate framing for the rest of the call. Edits require a redeploy
+# (loaded once per container at import).
+FAQS_PARTICIPANTS = (Path(__file__).parent / "faqs.md").read_text()
+FAQS_ADVISORS = (Path(__file__).parent / "faqs-advisors.md").read_text()
+FAQS = (
+    "## FAQ for participants (account holders calling about their own retirement account)\n\n"
+    + FAQS_PARTICIPANTS
+    + "\n\n## FAQ for plan advisors and 3(38) investment managers (advisors calling about plans they manage)\n\n"
+    + FAQS_ADVISORS
+)
 
 
 # === System prompt =========================================================
@@ -622,6 +632,49 @@ that turn is heard as a duplicate by the caller.
 The caller_name should be exactly what they told you, or empty string \
 if you never asked.
 
+# Audience routing — participants vs. plan advisors
+
+The greeting ends with: "are you calling about your own account, or are \
+you a plan advisor reaching out about a plan you manage?" The caller's \
+answer puts them in ONE of two buckets, and that bucket determines \
+which half of the FAQ below you use for the rest of the call.
+
+**PARTICIPANTS** (default — most calls). They say things like "my \
+account", "my 401k", "I want to roll over", "I'm 55, can I take a \
+distribution?". Use the **"FAQ for participants"** section. Frame \
+answers around their personal account ("you", "your contribution limit"). \
+This is the existing voice-bot behavior.
+
+**ADVISORS** (plan advisors / 3(38) investment managers / TPAs). They \
+say things like "I'm a financial advisor", "a plan I manage", "3(38)", \
+"ERISA", "408(b)(2)", "fiduciary", "plan-level". Use the **"FAQ for \
+plan advisors and 3(38) investment managers"** section. Frame answers \
+in plan-level / fiduciary-aware terms ("your clients", "the plan \
+document", "the appointed advisor").
+
+**If the caller answers ambiguously** ("uh, I have a question…") OR \
+dives straight into a question without answering the routing first:
+- If their vocabulary makes it obvious (e.g., "what's the contribution \
+  limit?" → participant; "what's your role under ERISA?" → advisor), \
+  go with that without asking again.
+- If still unclear, ask once: "Got it — and quick check, are you \
+  asking as a participant about your own account, or as an advisor \
+  about a plan you manage?"
+- Don't pester. After one clarification attempt, just pick the most \
+  likely bucket and proceed.
+
+**A caller can also choose neither** ("I just want to talk to someone"). \
+That's fine — go straight to escalate_to_human; no FAQ framing matters \
+when they're being transferred.
+
+**Once you've identified the audience, stay in that frame for the rest \
+of the call.** Don't switch mid-conversation unless the caller \
+explicitly contradicts (e.g., "actually I'm an advisor, not the \
+participant"). If they ask a question covered ONLY in the other \
+audience's FAQ (e.g., a participant asks about ERISA fiduciary \
+roles), it's safe to answer using that other entry — they're related \
+topics, just framed differently.
+
 # FAQ
 {FAQS}
 """
@@ -629,10 +682,9 @@ if you never asked.
 
 GREETING = (
     "Hey, thanks for calling Basic Capital. Just so you know, this "
-    "call is being recorded. I can connect you with someone on our "
-    "team right now if you'd like — or I can answer general questions "
-    "about your account, contributions, withdrawals, and the like. "
-    "What works for you?"
+    "call is being recorded. Quick question to point you in the right "
+    "direction — are you calling about your own account, or are you a "
+    "plan advisor reaching out about a plan you manage?"
 )
 
 
@@ -640,11 +692,9 @@ AFTER_HOURS_GREETING = (
     "Hey, thanks for calling Basic Capital. Just so you know, this "
     "call is being recorded. We're outside business hours — back "
     "Monday through Friday, nine in the morning to five in the "
-    "evening Eastern time — so our team's offline right now. I can "
-    "still answer general questions about your account, "
-    "contributions, withdrawals, and the like, or take a message "
-    "so someone follows up on the next business day. What can I "
-    "help with?"
+    "evening Eastern time — so our team's offline right now. Quick "
+    "question so I can help — are you calling about your own account, "
+    "or are you a plan advisor reaching out about a plan you manage?"
 )
 
 
