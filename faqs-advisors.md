@@ -47,14 +47,14 @@ Q: Are there restricted asset classes?
 A: Standard IRS prohibitions apply — life insurance, collectibles, and transactions with disqualified persons are off-limits. Outside those restrictions, the platform is open.
 
 Q: Can I standardize an investment lineup across multiple plans I manage?
-A: That is a plan-level configuration question best handled directly with our team. Let me connect you with someone who can walk through your options.
+A: That's a plan-level configuration question — the setup varies by plan. Want me to connect you with our team to walk through your options?
 
 # ============================================================================
 # 3. Fees & disclosure
 # ============================================================================
 
 Q: What does Basic Capital charge?
-A: Administration fees are based on plan size. We provide fee disclosure documentation to support your obligations under four-oh-eight b two and participant fee disclosures under four-oh-four a five. Contact our team for specific fee schedules.
+A: Administration fees are based on plan size. We provide fee disclosure documentation to support your obligations under four-oh-eight b two and participant fee disclosures under four-oh-four a five. Specific schedules are plan-dependent — want me to put you through to our team for those?
 
 Q: How are four-oh-eight b two and four-oh-four a five disclosures handled?
 A: Basic Capital generates the required fee disclosure documents. As the plan advisor, you should confirm these are delivered to the plan sponsor annually and upon any material change, as part of your fiduciary oversight obligations.
@@ -70,10 +70,10 @@ Q: What contribution types does the platform support?
 A: Employee deferrals — both pre-tax and Roth — employer match, and profit sharing. Catch-up contributions, prior-year IRA contributions, and Mega Backdoor Roth after-tax contributions are not yet supported. Advise clients with those needs before committing to the platform.
 
 Q: How are payroll integrations handled?
-A: Contributions flow via payroll deduction. Participants manage their deferral rate in-app, and rate changes lock approximately one week before each payroll cycle. For plan-specific payroll integration questions, I can connect you with our team.
+A: Contributions flow via payroll deduction. Participants manage their deferral rate in-app, and rate changes lock approximately one week before each payroll cycle. Plan-specific integration details vary by setup.
 
 Q: Do you support plan loans?
-A: Loan availability depends on whether loan provisions were adopted in the plan document. Let me connect you with our team to confirm what applies to a specific client's plan before you advise on in-plan loan access.
+A: Loan availability depends on whether loan provisions were adopted in the plan document. Want me to connect you so you can check a specific plan before advising on loan access?
 
 # ============================================================================
 # 5. Rollovers (incoming)
@@ -83,13 +83,13 @@ Q: Do you accept incoming rollovers?
 A: Incoming four-oh-one K to four-oh-one K rollovers are not currently processed — that feature is in development. IRA rollover eligibility depends on account type. Confirm current capabilities with our team before building a consolidation strategy for a client.
 
 Q: How long does a rollover take?
-A: Typically one to three weeks once the check is in transit. If it has been longer than that, let me connect you with our team to check status.
+A: Typically one to three weeks once the check is in transit. If it's been longer than that on a specific transfer, want me to put you through to check status?
 
 Q: Can a client roll a Roth four-oh-one K into a Roth IRA?
-A: Generally yes — Roth-to-Roth rollovers preserve the tax treatment. For the specifics of a client's plan, let me connect you with our team.
+A: Generally yes — Roth-to-Roth rollovers preserve the tax treatment. Specifics depend on the plan document.
 
 Q: Do you accept in-kind rollovers or A-C-A-T transfers?
-A: No. In-kind rollovers and A-C-A-T transfers are not supported. Incoming four-oh-one K rollovers are also not being processed right now. For other rollover paths, our team can walk through what is possible.
+A: No. In-kind rollovers and A-C-A-T transfers are not supported. Incoming four-oh-one K rollovers are also not being processed right now — all incoming has to come in as cash.
 
 # ============================================================================
 # 5b. Rollovers (outbound — leaving Basic Capital)
@@ -112,13 +112,13 @@ Q: What distribution options are available to separated participants?
 A: Lump-sum distribution or rollover to a qualified plan. The standard ten percent early-withdrawal penalty plus income tax applies for participants under fifty-nine and a half — that penalty goes to the IRS, not to Basic Capital. Hardship withdrawals require employer sign-off and process in approximately two to three weeks. In-service distributions depend on plan document provisions.
 
 Q: How should I advise a client considering an early distribution?
-A: Recommend they consult a tax advisor before initiating — the ten percent penalty plus ordinary income tax can significantly erode the distribution. Exceptions worth flagging to eligible clients include hardship, disability, separation from service at age fifty-five for four-oh-one Ks, and first-time home purchase for IRAs. Let me connect you with our team to confirm what exceptions apply to a specific plan.
+A: Recommend they consult a tax advisor before initiating — the ten percent penalty plus ordinary income tax can significantly erode the distribution. Exceptions worth flagging to eligible clients include hardship, disability, separation from service at age fifty-five for four-oh-one Ks, and first-time home purchase for IRAs. Plan-specific exceptions depend on the plan document — want me to connect you for a particular client?
 
 Q: Can a participant withdraw while still employed?
-A: Generally no for four-oh-one Ks — most plans require separation from the employer first. Some plans allow in-service distributions at certain ages. Let me connect you with our team to check the provisions in a specific plan document.
+A: Generally no for four-oh-one Ks — most plans require separation from the employer first. Some plans allow in-service distributions at certain ages — that's plan-document-specific.
 
 Q: How do hardship withdrawals work?
-A: Hardship withdrawals take approximately two to three weeks, require the employer's sign-off, and are subject to income tax plus the ten percent early-withdrawal penalty if the participant is under fifty-nine and a half. I can connect you with our team to determine eligibility for a specific client.
+A: Hardship withdrawals take approximately two to three weeks, require the employer's sign-off, and are subject to income tax plus the ten percent early-withdrawal penalty if the participant is under fifty-nine and a half. Eligibility is plan-specific.
 
 # ============================================================================
 # 7. Compliance & tax documents
@@ -128,14 +128,14 @@ Q: What tax reporting does Basic Capital handle?
 A: Ten ninety-nine Rs for distributions are issued by January thirty-first. Fifty-four ninety-eights for contributions are issued by May thirty-first, after the contribution deadline. Employee deferrals are reflected on participant W twos through the plan sponsor's payroll process — Basic Capital does not issue those.
 
 Q: What documentation is available for compliance reviews, plan audits, or fiduciary file maintenance?
-A: Contact our team for plan-level reporting, fee disclosure documentation, and plan document copies. For large-plan filers subject to an independent audit requirement, we can coordinate directly with your plan's auditor.
+A: Plan-level reporting, fee disclosure documentation, and plan document copies are all available — pulled together by our team on request. For large-plan filers subject to an independent audit requirement, we can coordinate directly with your plan's auditor.
 
 # ============================================================================
 # 8. Participant onboarding & identity verification
 # ============================================================================
 
 Q: What does participant onboarding require?
-A: Three components — a government-issued ID such as a driver's license or passport, bank account linking through Plaid, and execution of plan-specific agreements like the four-oh-one K plan adoption agreement or IRA account agreement. Higher-contribution plans may require a W two or accredited investor documentation. Our team can walk through the full requirements for a specific plan setup.
+A: Three components — a government-issued ID such as a driver's license or passport, bank account linking through Plaid, and execution of plan-specific agreements like the four-oh-one K plan adoption agreement or IRA account agreement. Higher-contribution plans may require a W two or accredited investor documentation.
 
 # ============================================================================
 # 9. Meta (hours, contact)
