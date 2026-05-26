@@ -10,6 +10,7 @@ can embed the Cartesia call_id and inbound caller number — Line's tool
 ctx is empty.
 """
 
+import asyncio
 import logging
 import os
 from typing import Annotated, Literal
@@ -170,20 +171,40 @@ def make_followup_tool(call_request: CallRequest, escalation_status=None):
             ],
         }
 
-        try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.post(webhook_url, json=message)
-            resp.raise_for_status()
-        except httpx.HTTPError as e:
-            logger.warning("Slack post failed: %s", e)
-            return _email_fallback_instruction(caller_name)
-
-        logger.info(
-            "Slack follow-up logged for call_id=%s name=%r method=%s",
-            call_id,
-            caller_name,
-            contact_method,
-        )
+        # Fire the Slack POST as a background task — DO NOT await before
+        # returning. Awaiting blocks the bot's spoken response by 200ms-5s
+        # (network jitter on the Slack webhook), which the caller hears
+        # as awkward silence after dictating their message ("are you
+        # still there?" prompts have been reported).
+        #
+        # Trade-off: if Slack fails (rare), the caller doesn't get the
+        # email-fallback instruction in their farewell. But:
+        #   - end_call_with_goodbye fires log_call_complete with
+        #     outcome=callback_logged, so the team still gets a Linear
+        #     ticket for the call.
+        #   - The post is retried implicitly by Slack's incoming-webhook
+        #     5xx behavior in some cases.
+        # Net: ~5s silence eliminated; rare Slack-only outage = one
+        # caller's verbal email-fallback instruction is missed.
+        async def _post_slack_bg():
+            try:
+                async with httpx.AsyncClient(timeout=10) as client:
+                    resp = await client.post(webhook_url, json=message)
+                resp.raise_for_status()
+                logger.info(
+                    "Slack follow-up logged for call_id=%s name=%r method=%s",
+                    call_id,
+                    caller_name,
+                    contact_method,
+                )
+            except httpx.HTTPError as e:
+                logger.warning(
+                    "Slack post failed (call_id=%s): %s — caller already "
+                    "got the success response; Linear ticket from "
+                    "end_call_with_goodbye is the fallback paper trail",
+                    call_id, e,
+                )
+        asyncio.create_task(_post_slack_bg())
 
         # Return value is the EXACT text the bot should speak — no meta
         # prefix like "Tell the caller:" because the LLM can mis-render
