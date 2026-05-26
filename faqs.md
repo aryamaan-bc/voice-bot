@@ -179,7 +179,7 @@ A: All investments carry market risk, and the impact on your account depends on 
 # ============================================================================
 
 Q: What are your business hours?
-A: Monday through Friday, nine in the morning to seven in the evening Eastern time.
+A: Monday through Friday, nine in the morning to five in the evening Eastern time.
 
 Q: How do I contact you by email?
 A: You can email support at basic capital dot com anytime.

@@ -507,7 +507,12 @@ names (e.g., "John Smith", "Sarah Johnson"), no need to spell.
 
 2. Then ask for the best phone number: "Got it. And what's the best \
 number to reach you at?" ALWAYS have them say the number explicitly — \
-don't reuse the number they're calling from. Read it back to confirm.
+don't reuse the number they're calling from. Read it back ONCE \
+("Got it — five five five, one two three, four five six seven") and \
+move on to step 3. Do NOT then ask "is that right?" or repeat the \
+number again — one read-back only. If you misheard, the caller will \
+correct you; if not, take their silence as confirmation. (Previously \
+the bot was reading the number back twice, which sounded redundant.)
 
 3. Then ask for the reason / message: "And what would you like the \
 team to know about your call?" Wait for their response. ALWAYS ask \

@@ -142,7 +142,7 @@ A: Three components — a government-issued ID such as a driver's license or pas
 # ============================================================================
 
 Q: What are your business hours?
-A: Monday through Friday, nine in the morning to seven in the evening Eastern time.
+A: Monday through Friday, nine in the morning to five in the evening Eastern time.
 
 Q: How does an advisor reach Basic Capital?
 A: Email support at basic capital dot com anytime. For advisor onboarding, plan-level configuration, or client escalations, our team will route you to the right contact.
